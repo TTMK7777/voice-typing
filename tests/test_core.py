@@ -1,0 +1,140 @@
+"""core ロジックのテスト(録音・文字起こし・貼り付け)。
+
+追加依存ゼロ(stdlib unittest + unittest.mock)。実行:
+    .venv/Scripts/python.exe -m unittest discover -s tests -v
+
+検証の要点:
+- paste() の clipboard 書込が失敗してもクラッシュしない / Ctrl+V を送らない。
+- _strip_hallucinations が Whisper の定番幻覚フレーズを除去する。
+
+GPU / マイク / クリップボードは不要。pyperclip と pynput は全てモックする
+(本物の Ctrl+V を端末へ送らないため _kb も必ずモックする)。
+"""
+import sys
+import os
+import unittest
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import core  # noqa: E402
+from core import VoiceCore  # noqa: E402
+
+
+class PasteSafetyTest(unittest.TestCase):
+    def test_safe_copy_swallows_exception(self):
+        with mock.patch.object(core.pyperclip, "copy", side_effect=RuntimeError("clipboard locked")):
+            self.assertFalse(VoiceCore._safe_copy("x"))
+
+    def test_safe_copy_returns_true_on_success(self):
+        with mock.patch.object(core.pyperclip, "copy") as cp:
+            self.assertTrue(VoiceCore._safe_copy("x"))
+            cp.assert_called_once_with("x")
+
+    def test_paste_skips_ctrl_v_when_clipboard_fails(self):
+        """copy 失敗時はクラッシュせず、かつ Ctrl+V を送らない(古い内容の誤貼り付け防止)。"""
+        vc = VoiceCore()
+        vc._kb = mock.MagicMock()                 # 本物の Ctrl+V を端末へ送らない
+        with mock.patch.object(core.time, "sleep"), \
+             mock.patch.object(core.pyperclip, "paste", return_value=""), \
+             mock.patch.object(core.pyperclip, "copy", side_effect=RuntimeError("locked")):
+            vc.paste("貼り付けるテキスト")        # 例外が伝播しなければ成功
+        vc._kb.press.assert_not_called()          # copy 失敗時は Ctrl+V を送らない
+
+    def test_paste_sends_ctrl_v_on_success(self):
+        """copy 成功時は Ctrl+V を送る(正常系の回帰検出)。"""
+        vc = VoiceCore()
+        vc._kb = mock.MagicMock()
+        with mock.patch.object(core.time, "sleep"), \
+             mock.patch.object(core.pyperclip, "paste", return_value="old"), \
+             mock.patch.object(core.pyperclip, "copy"):
+            vc.paste("貼り付けるテキスト")
+        self.assertTrue(vc._kb.press.called)      # Ctrl+V 送出
+
+
+class HallucinationStripTest(unittest.TestCase):
+    def test_strips_known_hallucination(self):
+        vc = VoiceCore()
+        self.assertEqual(
+            vc._strip_hallucinations("今日の議題です。ご視聴ありがとうございました"),
+            "今日の議題です。",
+        )
+
+    def test_keeps_normal_text(self):
+        vc = VoiceCore()
+        self.assertEqual(vc._strip_hallucinations("普通の文章です。"), "普通の文章です。")
+
+
+class VoiceCommandMatchTest(unittest.TestCase):
+    """音声コマンド照合(「クロード、クリア」→ /clear)。"""
+
+    def test_clear_with_punctuation(self):
+        self.assertEqual(core.match_voice_command("クロード、クリア。"), "/clear")
+
+    def test_clear_without_punctuation(self):
+        self.assertEqual(core.match_voice_command("クロードクリア"), "/clear")
+
+    def test_compact_plain(self):
+        self.assertEqual(core.match_voice_command("クロード、コンパクト"), "/compact")
+
+    def test_compact_with_topic_arg(self):
+        self.assertEqual(
+            core.match_voice_command("クロード、コンパクト、n8nの話"),
+            "/compact Focus on n8nの話",
+        )
+
+    def test_ascii_trigger_variant(self):
+        self.assertEqual(core.match_voice_command("Claude、クリア"), "/clear")
+
+    def test_normal_sentence_starting_with_trigger_is_not_command(self):
+        self.assertIsNone(core.match_voice_command("クロードに聞いてみようと思います。"))
+
+    def test_clear_with_trailing_words_rejected(self):
+        """引数非対応コマンドに続きが付く場合は誤認識の可能性 → 実行しない。"""
+        self.assertIsNone(core.match_voice_command("クロード、クリアしてください"))
+
+    def test_command_word_without_trigger_rejected(self):
+        self.assertIsNone(core.match_voice_command("クリア"))
+
+    def test_empty_and_none(self):
+        self.assertIsNone(core.match_voice_command(""))
+        self.assertIsNone(core.match_voice_command(None))
+
+
+class VoiceCommandRunTest(unittest.TestCase):
+    """コマンド実行経路(deliver / run_voice_command)。_kb は必ずモックする。"""
+
+    def _core(self):
+        vc = VoiceCore()
+        vc._kb = mock.MagicMock()
+        return vc
+
+    def test_deliver_runs_command_instead_of_paste(self):
+        vc = self._core()
+        with mock.patch.object(vc, "run_voice_command") as run, \
+             mock.patch.object(vc, "paste") as paste:
+            vc.deliver("クロード、クリア")
+        run.assert_called_once_with("/clear")
+        paste.assert_not_called()
+
+    def test_deliver_pastes_normal_text(self):
+        vc = self._core()
+        with mock.patch.object(vc, "run_voice_command") as run, \
+             mock.patch.object(vc, "paste") as paste:
+            vc.deliver("普通の口述テキストです。")
+        run.assert_not_called()
+        paste.assert_called_once_with("普通の口述テキストです。")
+
+    def test_run_voice_command_pastes_then_sends_enter_twice(self):
+        vc = self._core()
+        with mock.patch.object(core.time, "sleep"), \
+             mock.patch.object(vc, "paste") as paste:
+            vc.run_voice_command("/clear")
+        paste.assert_called_once_with("/clear")
+        enters = [c for c in vc._kb.press.call_args_list
+                  if c.args[0] == core.keyboard.Key.enter]
+        self.assertEqual(len(enters), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
