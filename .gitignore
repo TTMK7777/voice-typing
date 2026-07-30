@@ -1,0 +1,20 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# テスト副産物(再生成可)
+result.txt
+test.wav
+
+# 個人語彙(配布時は vocab.example.txt をコピーして使う)
+vocab.txt
+
+# ユーザー設定(端末固有なので配布しない)
+.vt_config.json
+
+# 開発者個人の作業メモ(公開しない)
+memory.md
+knowledge.md
+todo.md
+HANDOVER.md

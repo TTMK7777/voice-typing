@@ -1,0 +1,22 @@
+# voice-typing 依存パッケージ(バージョン固定)
+# インストール: .venv を作って `pip install -r requirements.txt`
+#
+# 動作前提: Windows + NVIDIA GPU (CUDA)。コードは device="cuda" 固定のため、
+# 現状 CPU では動きません(CPU 対応は将来課題)。
+
+# ---- アプリ本体 ----
+faster-whisper==1.2.1   # 文字起こし(ctranslate2 を自動で連れてくる)
+PySide6==6.11.1         # フローティング GUI
+sounddevice==0.5.5      # マイク録音
+numpy==2.4.6            # 音声バッファ処理
+pyperclip==1.11.0       # クリップボード経由の貼り付け
+pynput==1.8.2           # グローバルホットキー + キーストローク送出
+
+# ---- GPU / CUDA DLL (Windows) ----
+# ctranslate2 が必要とする CUDA ランタイム DLL を pip wheel で供給する。
+# cuda_setup.py がこれらの bin ディレクトリを DLL 探索パスに登録する。
+# (CUDA Toolkit を別途インストールしている場合は不要なこともある)
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cuda-nvrtc-cu12==12.9.86
+nvidia-cuda-runtime-cu12==12.9.79
+nvidia-cudnn-cu12==9.23.2.1
