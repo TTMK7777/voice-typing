@@ -51,6 +51,35 @@ class PasteSafetyTest(unittest.TestCase):
             vc.paste("貼り付けるテキスト")
         self.assertTrue(vc._kb.press.called)      # Ctrl+V 送出
 
+    def test_paste_restores_previous_clipboard(self):
+        """通常時は貼り付け後に元のクリップボード内容へ戻す。"""
+        vc = VoiceCore()
+        vc._kb = mock.MagicMock()
+        # paste(): ①復元用に元内容を読む ②復元直前に現在の内容を読む
+        with mock.patch.object(core.time, "sleep"), \
+             mock.patch.object(core.pyperclip, "paste",
+                               side_effect=["元の内容", "貼り付けるテキスト"]), \
+             mock.patch.object(core.pyperclip, "copy") as cp:
+            vc.paste("貼り付けるテキスト")
+        self.assertEqual(cp.call_args_list[-1], mock.call("元の内容"))
+
+    def test_paste_does_not_clobber_clipboard_changed_by_others(self):
+        """復元直前に別プロセスが新しい内容を置いていたら、復元して壊さない。
+
+        ユーザー自身の Ctrl+C やクリップボード管理ツールが割り込む場合がある。
+        ここで無条件に復元すると、その新しい内容を古い内容で踏み潰してしまう。
+        """
+        vc = VoiceCore()
+        vc._kb = mock.MagicMock()
+        with mock.patch.object(core.time, "sleep"), \
+             mock.patch.object(core.pyperclip, "paste",
+                               side_effect=["元の内容", "別プロセスが置いた新しい内容"]), \
+             mock.patch.object(core.pyperclip, "copy") as cp:
+            vc.paste("貼り付けるテキスト")
+        copied = [c.args[0] for c in cp.call_args_list]
+        self.assertNotIn("元の内容", copied)      # 復元しない
+        self.assertEqual(copied, ["貼り付けるテキスト"])
+
 
 class HallucinationStripTest(unittest.TestCase):
     def test_strips_known_hallucination(self):
