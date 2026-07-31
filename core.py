@@ -9,6 +9,13 @@ from pynput import keyboard
 
 SAMPLE_RATE = 16000
 
+# 貼り付け後、クリップボードを元の内容へ戻すまでの待ち時間(秒)。
+# 対象アプリが Ctrl+V を処理し終える前に復元してしまうと、復元後の「古い内容」が
+# 貼られてしまう。Windows には「クリップボードが読まれた」を知る一般的な手段が
+# 無いため、ここは確率的な緩和にとどまる(残存リスクは SECURITY.md「既知の限界」)。
+# 遅いアプリ(Electron 系・リモートデスクトップ)でも間に合うよう余裕を持たせている。
+PASTE_SETTLE_SEC = 0.4
+
 # ===== 音声コマンド =====
 # 「<トリガー語>、<コマンド語>」の発話を検知したら、テキストを貼り付ける代わりに
 # スラッシュコマンドを注入して Enter で実行する(Claude Code の /clear /compact 等を
@@ -169,9 +176,24 @@ class VoiceCore:
         self._kb.press("v")
         self._kb.release("v")
         self._kb.release(keyboard.Key.ctrl)
-        time.sleep(0.15)
+        time.sleep(PASTE_SETTLE_SEC)
         if self.restore_clipboard and old is not None:
-            self._safe_copy(old)
+            self._restore_clipboard(old, text)
+
+    def _restore_clipboard(self, old, pasted):
+        """貼り付け後にクリップボードを元の内容へ戻す。
+
+        自分が書いた内容がまだ残っているときだけ戻す。復元を待つ間に別プロセス
+        (ユーザー自身の Ctrl+C、クリップボード管理ツール等)が新しい内容を置いた
+        場合、無条件に復元するとその新しい内容を古い内容で踏み潰してしまうため。
+        """
+        try:
+            current = pyperclip.paste()
+        except Exception:
+            return  # 読めないなら触らない(壊すより何もしない方が安全)
+        if current != pasted:
+            return  # 他が書き換えている → 復元しない
+        self._safe_copy(old)
 
     def _press_enter(self):
         self._kb.press(keyboard.Key.enter)

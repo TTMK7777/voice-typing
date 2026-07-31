@@ -1,7 +1,7 @@
 """
 リアルタイム版: フローティングのマイクボタン + 暫定テキストのプレビュー。
 
-- 録音中、small モデルで 0.4 秒ごとに暫定テキストを更新表示(揺れる)
+- 録音中、small モデルで PREVIEW_INTERVAL 秒ごとに暫定テキストを更新表示(揺れる)
 - 停止で large-v3 が高精度確定 → アクティブウィンドウに自動入力
 - ボタン/プレビューともフォーカスを奪わない(入力先がズレない)
 """
@@ -239,20 +239,29 @@ class MicButton(QWidget):
 
     # ---- 録音中の Enter キーで停止(低レベルフック、メインスレッドで呼ばれる) ----
     def _on_low_level_key(self, nCode, wParam, lParam):
-        if nCode == 0:
-            kb = ctypes.cast(lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
-            if kb.vkCode == VK_RETURN:
-                if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                    if self._enter_suppressed:
-                        return 1  # キーリピート中: 抑制だけ継続し toggle は再発火させない
-                    if self.state == RECORDING:
-                        self._enter_suppressed = True
-                        self.notify.emit("__toggle__")
-                        return 1
-                elif wParam in (WM_KEYUP, WM_SYSKEYUP):
-                    if self._enter_suppressed:
-                        self._enter_suppressed = False
-                        return 1
+        # このコールバックは「システム全体のキー入力」が通る経路。ここで例外が出ると
+        # CallNextHookEx が呼ばれないまま 0 が返り、そのキーイベントがフックチェーンで
+        # 止まる = IME・支援技術・他のホットキー管理ツールがそのキーを取り逃す。
+        # 自分が壊れても他アプリの入力経路は壊さないため、全体を try で包む。
+        # (終了処理中に Qt オブジェクトが破棄済みで self.state アクセスが
+        #  RuntimeError になるケースが実際に起こりうる)
+        try:
+            if nCode == 0:
+                kb = ctypes.cast(lParam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
+                if kb.vkCode == VK_RETURN:
+                    if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                        if self._enter_suppressed:
+                            return 1  # キーリピート中: 抑制だけ継続し toggle は再発火させない
+                        if self.state == RECORDING:
+                            self._enter_suppressed = True
+                            self.notify.emit("__toggle__")
+                            return 1
+                    elif wParam in (WM_KEYUP, WM_SYSKEYUP):
+                        if self._enter_suppressed:
+                            self._enter_suppressed = False
+                            return 1
+        except Exception:
+            pass  # 握り潰してでも下の CallNextHookEx へ必ず到達させる
         return user32.CallNextHookEx(self._enter_hook_id, nCode, wParam, lParam)
 
     def _uninstall_enter_hook(self):
@@ -338,7 +347,7 @@ class MicButton(QWidget):
 def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    mic = MicButton()   # noqa: F841  参照を保持しないとGCで消える
+    MicButton()
 
     tray = QSystemTrayIcon()
     pix = QPixmap(32, 32)
