@@ -1,4 +1,5 @@
 """音声入力のコアロジック(録音・文字起こし・貼り付け)。CLI版/GUI版で共有。"""
+import threading
 import time
 
 import cuda_setup  # noqa: F401  CUDA DLL パス登録(faster_whisper より前)
@@ -15,6 +16,10 @@ SAMPLE_RATE = 16000
 # 無いため、ここは確率的な緩和にとどまる(残存リスクは SECURITY.md「既知の限界」)。
 # 遅いアプリ(Electron 系・リモートデスクトップ)でも間に合うよう余裕を持たせている。
 PASTE_SETTLE_SEC = 0.4
+
+# ウェイクワード待受でマイクを監視する際の1ブロックの長さ(秒)。
+# 短いほど反応が速いがコールバック回数が増える。
+MONITOR_BLOCK_SEC = 0.1
 
 # ===== 音声コマンド =====
 # 「<トリガー語>、<コマンド語>」の発話を検知したら、テキストを貼り付ける代わりに
@@ -84,6 +89,9 @@ class VoiceCore:
         self.recording = False
         self._frames = []
         self._stream = None
+        self._monitor_stream = None
+        self._monitor_cb = None
+        self._restore_thread = None
         self._kb = keyboard.Controller()
         self.initial_prompt = self._build_prompt()
 
@@ -136,6 +144,44 @@ class VoiceCore:
             return None
         return np.concatenate(self._frames, axis=0).flatten()
 
+    # ---- ウェイクワード待受用のマイク監視 ----
+    # 録音(start_recording)とは別のストリーム。両方を同時に開くことはなく、
+    # 録音を始める前に必ず stop_monitor() で閉じる(GUI 側が保証)。
+    # 受け取った音声はメモリ上のバッファのみで、保存も送信もしない。
+    def start_monitor(self, on_block):
+        """マイクの常時監視を開始し、音声ブロックを on_block(np.ndarray) に渡す。
+
+        すでに監視中なら**ストリームは開いたまま渡し先だけ差し替える**。
+        ウェイクワード待受 → 連続口述の切り替えでマイクを閉じて開き直すと、
+        その間の音が落ちて発話の頭が欠けるため。
+        """
+        self._monitor_cb = on_block
+        if self._monitor_stream is not None:
+            return
+        self._monitor_stream = sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+            blocksize=int(SAMPLE_RATE * MONITOR_BLOCK_SEC),
+            callback=self._monitor_callback,
+        )
+        self._monitor_stream.start()
+
+    def _monitor_callback(self, indata, frame_count, time_info, status):
+        cb = self._monitor_cb
+        if cb is None:
+            return
+        try:
+            cb(indata.copy().flatten())
+        except Exception:
+            pass  # オーディオコールバックで例外を投げるとストリームごと死ぬため握り潰す
+
+    def stop_monitor(self):
+        """マイクの常時監視を停止する(停止済みなら何もしない)。"""
+        self._monitor_cb = None
+        if self._monitor_stream is not None:
+            self._monitor_stream.stop()
+            self._monitor_stream.close()
+            self._monitor_stream = None
+
     def _strip_hallucinations(self, text):
         """無音/末尾に出る Whisper の定番幻覚フレーズを除去する。"""
         for h in HALLUCINATIONS:
@@ -176,9 +222,18 @@ class VoiceCore:
         self._kb.press("v")
         self._kb.release("v")
         self._kb.release(keyboard.Key.ctrl)
-        time.sleep(PASTE_SETTLE_SEC)
+        # ここで貼り付けは完了している。復元待ちは別スレッドへ回す:
+        # 連続口述では発話を1件ずつ直列に処理するため、ここで PASTE_SETTLE_SEC を
+        # 待つと次の発話の文字起こしがその分だけ後ろにずれる。
         if self.restore_clipboard and old is not None:
-            self._restore_clipboard(old, text)
+            self._restore_thread = threading.Thread(
+                target=self._restore_after_settle, args=(old, text), daemon=True)
+            self._restore_thread.start()
+
+    def _restore_after_settle(self, old, pasted):
+        """貼り付け先が Ctrl+V を処理し終える頃合いを待ってから復元する。"""
+        time.sleep(PASTE_SETTLE_SEC)
+        self._restore_clipboard(old, pasted)
 
     def _restore_clipboard(self, old, pasted):
         """貼り付け後にクリップボードを元の内容へ戻す。

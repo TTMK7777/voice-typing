@@ -12,6 +12,7 @@ GPU / マイク / クリップボードは不要。pyperclip と pynput は全�
 """
 import sys
 import os
+import threading
 import unittest
 from unittest import mock
 
@@ -61,7 +62,32 @@ class PasteSafetyTest(unittest.TestCase):
                                side_effect=["元の内容", "貼り付けるテキスト"]), \
              mock.patch.object(core.pyperclip, "copy") as cp:
             vc.paste("貼り付けるテキスト")
+            vc._restore_thread.join(timeout=2)  # 復元は別スレッド(貼り付けを待たせないため)
         self.assertEqual(cp.call_args_list[-1], mock.call("元の内容"))
+
+    def test_paste_does_not_block_on_clipboard_restore(self):
+        """復元待ちで貼り付けを足止めしない。
+
+        連続口述では発話を1件ずつ直列に処理するため、ここで PASTE_SETTLE_SEC を
+        待つと次の発話の文字起こしがその分だけ後ろにずれる。待ちは別スレッドで行う。
+        """
+        vc = VoiceCore()
+        vc._kb = mock.MagicMock()
+        slept = []
+        main = threading.current_thread().name
+
+        def fake_sleep(seconds):
+            slept.append((threading.current_thread().name, seconds))
+
+        with mock.patch.object(core.time, "sleep", side_effect=fake_sleep),              mock.patch.object(core.pyperclip, "paste",
+                               side_effect=["元の内容", "貼り付けるテキスト"]),              mock.patch.object(core.pyperclip, "copy"):
+            vc.paste("貼り付けるテキスト")
+            vc._restore_thread.join(timeout=2)
+
+        on_main = [s for t, s in slept if t == main and s == core.PASTE_SETTLE_SEC]
+        anywhere = [s for _, s in slept if s == core.PASTE_SETTLE_SEC]
+        self.assertFalse(on_main, "復元待ちが貼り付けを足止めしている")
+        self.assertTrue(anywhere, "復元前の待ちが消えている(早すぎる復元で誤貼り付けの恐れ)")
 
     def test_paste_does_not_clobber_clipboard_changed_by_others(self):
         """復元直前に別プロセスが新しい内容を置いていたら、復元して壊さない。
@@ -76,6 +102,7 @@ class PasteSafetyTest(unittest.TestCase):
                                side_effect=["元の内容", "別プロセスが置いた新しい内容"]), \
              mock.patch.object(core.pyperclip, "copy") as cp:
             vc.paste("貼り付けるテキスト")
+            vc._restore_thread.join(timeout=2)
         copied = [c.args[0] for c in cp.call_args_list]
         self.assertNotIn("元の内容", copied)      # 復元しない
         self.assertEqual(copied, ["貼り付けるテキスト"])
