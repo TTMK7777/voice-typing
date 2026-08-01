@@ -52,7 +52,7 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1
 - 使い方: 「**やっほークロード**」と言う → **ひと呼吸おいてから**本文を喋る → 黙れば自動で確定・貼り付け
 
 ```
-（緑＝待受）  「やっほークロード」  →  （赤＝録音）  本文を喋る  →  2秒黙る  →  貼り付け
+（緑＝待受）  「やっほークロード」  →  （赤＝録音）  本文を喋る  →  1秒黙る  →  貼り付け
 ```
 
 - ウェイクワードと本文の間は**少し間を空けてください**。待受用のマイクを閉じて録音用に開き直すため、
@@ -92,7 +92,7 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1
 | 新しい幻覚フレーズを消す | `core.py` の `HALLUCINATIONS` に1行追加 |
 | ウェイクワードを変える | `wake_word.py` の `_WAKE_RE`(表記揺れを吸収するため正規化後のパターン) |
 | ウェイクワードが拾われにくい/誤発火する | `wake_listener.py` の `SPEECH_RMS`(下げると拾いやすく、上げると誤発火が減る) |
-| 喋り終わりの自動確定までの間 | `app_rt.py` の `AUTO_STOP_SILENCE_SEC` |
+| 喋り終わりの自動確定までの間 | `app_rt.py` の `AUTO_STOP_SILENCE_SEC`(既定 1.0 秒。短いほど速いが文中の「間」で切られやすい) |
 
 ## ファイル構成
 

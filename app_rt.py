@@ -70,7 +70,12 @@ MAX_PREVIEW_CHARS = 120    # プレビューに表示する末尾文字数(あ�
 PREVIEW_MODEL = "small"    # 暫定モデル。"tiny" にすると更に高速(精度は落ちる/確定で直る)
 
 # ウェイクワードで始まった録音を自動で止める条件(手で止めなくて済むようにするため)
-AUTO_STOP_SILENCE_SEC = 2.0   # 喋り終わってからこれだけ無音が続いたら確定する
+# 手押しのときは Enter/ボタンで即座に止まるので、ここの待ち時間がそのまま
+# 「喋り終わってから貼られるまで」の体感差になる。短くするほど速いが、
+# 文の途中の「間」で切られやすくなるトレードオフ。
+AUTO_STOP_SILENCE_SEC = 1.0   # 喋り終わってからこれだけ無音が続いたら確定する
+SILENCE_TAIL_SEC = 0.15       # 無音判定に使う直近音声の長さ(長いほど判定が遅れる)
+WATCHDOG_POLL_SEC = 0.1       # 無音チェックの間隔
 WAKE_START_GRACE_SEC = 5.0    # 起動後この時間まったく喋らなければ空振りとして終了する
 MAX_RECORD_SEC = 120.0        # 保険。何かの拍子に止まらなくなっても必ず打ち切る
 
@@ -251,9 +256,9 @@ class MicButton(QWidget):
         started = time.time()
         last_voice = started
         spoke = False
-        tail_samples = int(SAMPLE_RATE * 0.3)
+        tail_samples = int(SAMPLE_RATE * SILENCE_TAIL_SEC)
         while self.state == RECORDING and self._wake_session:
-            time.sleep(0.15)
+            time.sleep(WATCHDOG_POLL_SEC)
             audio = self.core.snapshot_audio()
             if audio is not None and len(audio):
                 if rms(audio[-tail_samples:]) >= SPEECH_RMS:
@@ -309,9 +314,15 @@ class MicButton(QWidget):
             audio = self.core.stop_recording()
             if audio is None or len(audio) == 0:
                 return
+            t_stop = time.time()
             text = self.core.transcribe(audio)
+            t_text = time.time()
             if text:
                 self.core.deliver(text)
+            # 遅く感じたときにどこが重いかを当てずっぽうでなく数字で見るためのログ。
+            # 「喋り終わり → 貼り付け」の体感 = AUTO_STOP_SILENCE_SEC + 確定 + 貼付。
+            print(f"[timing] 音声 {len(audio) / SAMPLE_RATE:.1f}s / "
+                  f"確定 {t_text - t_stop:.2f}s / 貼付 {time.time() - t_text:.2f}s")
         finally:
             self._wake_session = False
             self.preview_text.emit("__hide__")
