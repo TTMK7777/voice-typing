@@ -17,15 +17,19 @@ from PySide6.QtWidgets import QApplication, QWidget, QLabel, QSystemTrayIcon, QM
 from pynput import keyboard as pynput_keyboard
 
 from core import VoiceCore, SAMPLE_RATE
+from wake_listener import WakeDetector, rms, SPEECH_RMS
 
 IDLE, LOADING, RECORDING, BUSY = "idle", "loading", "recording", "busy"
+LISTENING = "listening"                # ウェイクワード待受中(state ではなく IDLE の表示色)
 COLORS = {
     IDLE: QColor("#2d7dd2"),
     LOADING: QColor("#868e96"),
     RECORDING: QColor("#e03131"),
     BUSY: QColor("#f08c00"),
+    LISTENING: QColor("#2f9e44"),
 }
 HOTKEY = "<ctrl>+<alt>+<space>"        # 生口述(録音 開始/停止)
+WAKE_HOTKEY = "<ctrl>+<alt>+l"         # ウェイクワード待受の ON/OFF
 BTN_SIZE = 64
 
 # ===== 録音中の Enter キーで停止 =====
@@ -64,6 +68,11 @@ user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
 PREVIEW_INTERVAL = 0.2     # 暫定変換の最短間隔(秒)。変換が速ければこの間隔で更新
 MAX_PREVIEW_CHARS = 120    # プレビューに表示する末尾文字数(あふれ防止)
 PREVIEW_MODEL = "small"    # 暫定モデル。"tiny" にすると更に高速(精度は落ちる/確定で直る)
+
+# ウェイクワードで始まった録音を自動で止める条件(手で止めなくて済むようにするため)
+AUTO_STOP_SILENCE_SEC = 2.0   # 喋り終わってからこれだけ無音が続いたら確定する
+WAKE_START_GRACE_SEC = 5.0    # 起動後この時間まったく喋らなければ空振りとして終了する
+MAX_RECORD_SEC = 120.0        # 保険。何かの拍子に止まらなくなっても必ず打ち切る
 
 
 def apply_noactivate(widget):
@@ -151,12 +160,23 @@ class MicButton(QWidget):
         self._drag_pos = None
         self._moved = False
         self._preview_running = False
+        # ウェイクワード待受: small モデルを暫定プレビューと共用するため排他する
+        self._model_lock = threading.Lock()
+        self.wake_on = False
+        self._wake_session = False   # 今の録音がウェイクワード起動かどうか
+        self._wake = WakeDetector(
+            transcribe=self._wake_transcribe,
+            on_wake=lambda: self.notify.emit("__wake__"),
+            sample_rate=SAMPLE_RATE,
+            log=print,
+        )
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setToolTip(
             "クリック / Ctrl+Alt+Space = 録音 開始/停止\n"
+            "Ctrl+Alt+L = ウェイクワード待受(「やっほークロード」)の ON/OFF\n"
             "録音中は Enter でも停止できます\n"
             "右クリック = メニュー"
         )
@@ -176,6 +196,7 @@ class MicButton(QWidget):
 
         self._hk = pynput_keyboard.GlobalHotKeys({
             HOTKEY: lambda: self.notify.emit("__toggle__"),
+            WAKE_HOTKEY: lambda: self.notify.emit("__wake_toggle__"),
         })
         self._hk.start()
 
@@ -183,6 +204,7 @@ class MicButton(QWidget):
         self._enter_hook_proc = _HOOKPROC(self._on_low_level_key)
         self._enter_hook_id = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._enter_hook_proc, None, 0)
         QApplication.instance().aboutToQuit.connect(self._uninstall_enter_hook)
+        QApplication.instance().aboutToQuit.connect(self._stop_listening)
 
     def _load_models(self):
         # 暫定用(small)→ 確定用(large-v3)の順でロード
@@ -190,14 +212,70 @@ class MicButton(QWidget):
         self.core.load_model()
         self.state_changed.emit(IDLE)
 
+    # ---- ウェイクワード待受 ----
+    def set_wake_mode(self, on):
+        if on and self.state == LOADING:
+            print("[wake] モデルのロード中は待受を開始できません")
+            return
+        self.wake_on = bool(on)
+        if self.wake_on:
+            self._start_listening()
+        else:
+            self._stop_listening()
+        print(f"[wake] 待受 {'ON' if self.wake_on else 'OFF'}")
+
+    def _start_listening(self):
+        """IDLE のときだけマイク監視を開く(録音中は録音側がマイクを使う)。"""
+        if not self.wake_on or self.state != IDLE:
+            return
+        try:
+            self._wake.start()
+            self.core.start_monitor(self._wake.feed)
+        except Exception as e:
+            print(f"[wake] マイク監視を開始できませんでした: {e}")
+            self._wake.stop()
+            self.wake_on = False
+        self.update()
+
+    def _stop_listening(self):
+        self.core.stop_monitor()
+        self._wake.stop()
+        self.update()
+
+    def _wake_transcribe(self, audio):
+        with self._model_lock:
+            return self.core.transcribe_preview(audio)
+
+    def _silence_watchdog(self):
+        """ウェイクワードで始まった録音を、喋り終わりの無音で自動確定する。"""
+        started = time.time()
+        last_voice = started
+        spoke = False
+        tail_samples = int(SAMPLE_RATE * 0.3)
+        while self.state == RECORDING and self._wake_session:
+            time.sleep(0.15)
+            audio = self.core.snapshot_audio()
+            if audio is not None and len(audio):
+                if rms(audio[-tail_samples:]) >= SPEECH_RMS:
+                    last_voice = time.time()
+                    spoke = True
+            now = time.time()
+            limit = AUTO_STOP_SILENCE_SEC if spoke else WAKE_START_GRACE_SEC
+            if now - last_voice >= limit or now - started >= MAX_RECORD_SEC:
+                self.notify.emit("__toggle__")
+                return
+
     # ---- 録音トグル ----
     def toggle(self):
         if self.state == LOADING:
             return
         if self.state == IDLE:
+            self._stop_listening()   # 録音と待受で同じマイクを取り合わないよう先に閉じる
             self.core.start_recording()
             self.state_changed.emit(RECORDING)
             self._start_preview()
+            if self._wake_session:
+                threading.Thread(target=self._silence_watchdog, daemon=True).start()
         elif self.state == RECORDING:
             self._preview_running = False
             self.state_changed.emit(BUSY)
@@ -217,7 +295,8 @@ class MicButton(QWidget):
             audio = self.core.snapshot_audio()
             if audio is not None and len(audio) > SAMPLE_RATE * 0.3:
                 try:
-                    text = self.core.transcribe_preview(audio)
+                    with self._model_lock:
+                        text = self.core.transcribe_preview(audio)
                     if self._preview_running:
                         self.preview_text.emit(text)
                 except Exception:
@@ -234,8 +313,9 @@ class MicButton(QWidget):
             if text:
                 self.core.deliver(text)
         finally:
+            self._wake_session = False
             self.preview_text.emit("__hide__")
-            self.state_changed.emit(IDLE)
+            self.state_changed.emit(IDLE)  # 待受 ON なら _on_state がマイク監視を再開する
 
     # ---- 録音中の Enter キーで停止(低レベルフック、メインスレッドで呼ばれる) ----
     def _on_low_level_key(self, nCode, wParam, lParam):
@@ -272,6 +352,8 @@ class MicButton(QWidget):
     # ---- シグナルハンドラ(メインスレッド) ----
     def _on_state(self, state):
         self.state = state
+        if state == IDLE and self.wake_on:
+            self._start_listening()
         self.update()
 
     def _on_preview(self, text):
@@ -283,12 +365,24 @@ class MicButton(QWidget):
     def _on_notify(self, msg):
         if msg == "__toggle__":
             self.toggle()
+        elif msg == "__wake_toggle__":
+            self.set_wake_mode(not self.wake_on)
+        elif msg == "__wake__":
+            # ウェイクワード検出。この時点で待受は自分で止まっているので録音へ移る。
+            if self.state == IDLE:
+                self._wake_session = True
+                self.toggle()
+            else:
+                self._start_listening()  # 録音中などに来たら無視して待受へ戻す
 
     # ---- 描画 ----
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.setBrush(QBrush(COLORS.get(self.state, COLORS[IDLE])))
+        color = COLORS.get(self.state, COLORS[IDLE])
+        if self.state == IDLE and self.wake_on:
+            color = COLORS[LISTENING]   # 緑 = ウェイクワードを待っている
+        p.setBrush(QBrush(color))
         p.setPen(Qt.NoPen)
         m = 6
         p.drawEllipse(m, m, self.width() - 2 * m, self.height() - 2 * m)
@@ -340,6 +434,12 @@ class MicButton(QWidget):
             e.accept()
         elif e.button() == Qt.RightButton:
             m = QMenu()
+            wake = m.addAction("ウェイクワード待受(「やっほークロード」)")
+            wake.setCheckable(True)
+            wake.setChecked(self.wake_on)
+            wake.setEnabled(self.state != LOADING)
+            wake.triggered.connect(self.set_wake_mode)
+            m.addSeparator()
             m.addAction("終了").triggered.connect(QApplication.quit)
             m.exec(e.globalPosition().toPoint())
 
