@@ -1,4 +1,5 @@
 """音声入力のコアロジック(録音・文字起こし・貼り付け)。CLI版/GUI版で共有。"""
+import threading
 import time
 
 import cuda_setup  # noqa: F401  CUDA DLL パス登録(faster_whisper より前)
@@ -90,6 +91,7 @@ class VoiceCore:
         self._stream = None
         self._monitor_stream = None
         self._monitor_cb = None
+        self._restore_thread = None
         self._kb = keyboard.Controller()
         self.initial_prompt = self._build_prompt()
 
@@ -220,9 +222,18 @@ class VoiceCore:
         self._kb.press("v")
         self._kb.release("v")
         self._kb.release(keyboard.Key.ctrl)
-        time.sleep(PASTE_SETTLE_SEC)
+        # ここで貼り付けは完了している。復元待ちは別スレッドへ回す:
+        # 連続口述では発話を1件ずつ直列に処理するため、ここで PASTE_SETTLE_SEC を
+        # 待つと次の発話の文字起こしがその分だけ後ろにずれる。
         if self.restore_clipboard and old is not None:
-            self._restore_clipboard(old, text)
+            self._restore_thread = threading.Thread(
+                target=self._restore_after_settle, args=(old, text), daemon=True)
+            self._restore_thread.start()
+
+    def _restore_after_settle(self, old, pasted):
+        """貼り付け先が Ctrl+V を処理し終える頃合いを待ってから復元する。"""
+        time.sleep(PASTE_SETTLE_SEC)
+        self._restore_clipboard(old, pasted)
 
     def _restore_clipboard(self, old, pasted):
         """貼り付け後にクリップボードを元の内容へ戻す。

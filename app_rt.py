@@ -74,7 +74,7 @@ PREVIEW_MODEL = "small"    # 暫定モデル。"tiny" にすると更に高速(�
 # ===== 連続口述セッション(ウェイクワードで始まり、喋る→黙る→貼る を繰り返す) =====
 # ここの無音の長さがそのまま「喋り終わってから貼られるまで」の体感になる。
 # 短いほど自然だが、文の途中の「間」で区切られて細切れに貼られやすくなる。
-DICTATE_SILENCE_SEC = 0.7      # これだけ黙ったら、そこまでを1つの発話として貼り付ける
+DICTATE_SILENCE_SEC = 0.5      # これだけ黙ったら、そこまでを1つの発話として貼り付ける
 MIN_UTTERANCE_SEC = 0.5        # これより短い音は貼らない(相槌・物音で貼られないように)
 MAX_UTTERANCE_SEC = 60.0       # 1発話の上限(区切らず喋り続けた場合の保険)
 SESSION_IDLE_TIMEOUT_SEC = 30.0  # 何も喋らないままこの時間たったらセッションを終える
@@ -302,8 +302,11 @@ class MicButton(QWidget):
         t_text = time.time()
         if text:
             self.core.deliver(text)
+        # 「喋り終わってから貼られるまで」の体感 = DICTATE_SILENCE_SEC + 確定 + 貼付。
+        # 貼付にクリップボード復元待ちは含まない(別スレッドへ回してあるため)。
         safe_log(f"[timing] 音声 {len(audio) / SAMPLE_RATE:.1f}s / "
-              f"確定 {t_text - t_start:.2f}s / 貼付 {time.time() - t_text:.2f}s")
+                 f"確定 {t_text - t_start:.2f}s / 貼付 {time.time() - t_text:.2f}s / "
+                 f"体感 {DICTATE_SILENCE_SEC + time.time() - t_start:.2f}s")
 
     def _session_watchdog(self):
         """しばらく何も喋らなければセッションを終える(言いっぱなしの放置対策)。"""

@@ -56,9 +56,9 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1
 ```
 （緑＝待受）  「やっほークロード」
       ↓
-（赤＝連続口述）  喋る → 0.7秒黙る → 貼り付け
-                  喋る → 0.7秒黙る → 貼り付け
-                  喋る → 0.7秒黙る → 貼り付け  … 止めるまで繰り返す
+（赤＝連続口述）  喋る → 0.5秒黙る → 貼り付け
+                  喋る → 0.5秒黙る → 貼り付け
+                  喋る → 0.5秒黙る → 貼り付け  … 止めるまで繰り返す
 ```
 
 - **止め方**: マイクボタンをクリック / `Ctrl+Alt+Space` / 30 秒何も喋らない
@@ -69,8 +69,11 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1
 ```
 [wake] 'やっほーくろーど' -> HIT
 [session] 開始: 喋る → 黙る → 貼り付け。止めるにはボタン/Ctrl+Alt+Space
-[timing] 音声 3.8s / 確定 0.35s / 貼付 0.46s
+[timing] 音声 3.8s / 確定 0.35s / 貼付 0.05s / 体感 0.90s
 ```
+
+`体感` が「喋り終わってから貼られるまで」の実測（＝ `DICTATE_SILENCE_SEC` + 確定 + 貼付）。
+遅いと感じたときは、この内訳のどれが大きいかを見て調整してください。
 
 - **音声コマンドは従来どおりトリガー語が必要**です。口述中も「クロード、クリア」と
   言ってください(ウェイクワードだけでコマンドが撃てると、誤発火時に Enter まで飛ぶため)
@@ -105,7 +108,7 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1
 | 新しい幻覚フレーズを消す | `core.py` の `HALLUCINATIONS` に1行追加 |
 | ウェイクワードを変える | `wake_word.py` の `_WAKE_RE`(表記揺れを吸収するため正規化後のパターン) |
 | ウェイクワードが拾われにくい/誤発火する | `wake_listener.py` の `SPEECH_RMS`(下げると拾いやすく、上げると誤発火が減る) |
-| 喋り終わりから貼られるまでの間 | `app_rt.py` の `DICTATE_SILENCE_SEC`(既定 0.7 秒。短いほど速いが文中の「間」で細切れに貼られやすい) |
+| 喋り終わりから貼られるまでの間 | `app_rt.py` の `DICTATE_SILENCE_SEC`(既定 0.5 秒。短いほど速いが文中の「間」で細切れに貼られやすい) |
 | 口述セッションが自動で終わるまでの時間 | `app_rt.py` の `SESSION_IDLE_TIMEOUT_SEC`(既定 30 秒) |
 
 ## ファイル構成
