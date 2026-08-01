@@ -14,6 +14,7 @@ import os
 import sys
 import time
 import unittest
+import unittest.mock
 
 import numpy as np
 
@@ -134,11 +135,21 @@ class WakeDetectorTest(unittest.TestCase):
             det.feed(signal[i:i + step])
 
     def _wait(self, det, timeout=2.0):
-        """worker が判定を終えるまで待つ。"""
+        """worker の処理が落ち着く(呼び出し回数が変化しなくなる)まで待つ。
+
+        キューが空になるのを待つ方式は使えない: stop() は worker を起こすための
+        番兵をキューに入れるため、検出後は「空にならない」まま待ち続けてしまう。
+        """
         deadline = time.time() + timeout
-        while time.time() < deadline and not det._queue.empty():
-            time.sleep(0.01)
-        time.sleep(0.05)
+        stable = 0
+        last = None
+        while time.time() < deadline:
+            snapshot = (len(self.seen), len(self.fired))
+            stable = stable + 1 if snapshot == last else 0
+            if stable >= 2:
+                return
+            last = snapshot
+            time.sleep(0.03)
 
     def test_silence_never_reaches_transcribe(self):
         det = self._make()
@@ -191,7 +202,7 @@ class WakeDetectorTest(unittest.TestCase):
         det.start()
         self._feed(det, np.concatenate([_tone(0.8, 0.2), _silence(1.0)]))
         self._wait(det)
-        self.assertFalse(det._enabled)
+        self.assertFalse(det.enabled)
         self._feed(det, np.concatenate([_tone(0.8, 0.2), _silence(1.0)]))
         self._wait(det)
         det.stop()
@@ -205,7 +216,7 @@ class WakeDetectorTest(unittest.TestCase):
         self._feed(det, np.concatenate([_tone(0.8, 0.2), _silence(1.0)]))
         self._wait(det)
         det.start()   # アプリが IDLE に戻って待受を再開する相当
-        self.assertTrue(det._enabled)
+        self.assertTrue(det.enabled)
         self._feed(det, np.concatenate([_tone(0.8, 0.2), _silence(1.0)]))
         self._wait(det)
         det.stop()
@@ -220,7 +231,7 @@ class WakeDetectorTest(unittest.TestCase):
         det.stop()
         self.assertTrue(self.seen)
         for length in self.seen:
-            self.assertLessEqual(length, wake_listener.MAX_SEGMENT_SEC + 0.15)
+            self.assertLessEqual(length, wake_listener.WAKE_MAX_SEGMENT_SEC + 0.15)
 
     def test_long_speech_is_checked_without_waiting_for_silence(self):
         # 間を空けずに喋り続けても、CHECK_INTERVAL_SEC ごとに判定が走る
@@ -236,6 +247,141 @@ class WakeDetectorTest(unittest.TestCase):
         self._feed(det, np.concatenate([_tone(0.8, 0.2), _silence(1.0)]))
         self._wait(det)
         self.assertEqual(self.seen, [])
+
+
+class _Cp932Stdout:
+    """cp932 のコンソールを模したダミー stdout(表現できない文字で例外を投げる)。"""
+
+    encoding = "cp932"
+
+    def __init__(self):
+        self.written = []
+
+    def write(self, s):
+        s.encode("cp932")   # 表現できなければ UnicodeEncodeError
+        self.written.append(s)
+
+    def flush(self):
+        pass
+
+
+class SafeLogTest(unittest.TestCase):
+    """ログ出力でアプリを死なせないこと。
+
+    Windows のコンソールは既定 cp932 で、Whisper は cp932 に無い文字を返しうる。
+    素の print だと UnicodeEncodeError で判定スレッドごと落ち、
+    「緑なのに何も反応しない」状態になる。
+    """
+
+    def test_plain_text_is_printed(self):
+        out = _Cp932Stdout()
+        with unittest.mock.patch.object(sys, "stdout", out):
+            wake_listener.safe_log("[wake] 待受 ON")
+        self.assertIn("[wake] 待受 ON", "".join(out.written))
+
+    def test_unencodable_text_does_not_raise(self):
+        out = _Cp932Stdout()
+        with unittest.mock.patch.object(sys, "stdout", out):
+            wake_listener.safe_log("[wake] 'やっほークロード🙂—' -> HIT")
+        self.assertTrue(out.written, "置換して出力されていない")
+
+    def test_detection_survives_unencodable_transcription(self):
+        # ログが落ちても検出は成立すること(ログのために機能を止めない)
+        fired = []
+        out = _Cp932Stdout()
+        det = wake_listener.WakeDetector(
+            transcribe=lambda audio: "やっほークロード🙂",
+            on_wake=lambda: fired.append(True),
+            log=wake_listener.safe_log,
+        )
+        with unittest.mock.patch.object(sys, "stdout", out):
+            det.start()
+            step = int(0.1 * wake_listener.SAMPLE_RATE)
+            signal = np.concatenate([_tone(0.8, 0.2), _silence(1.0)])
+            for i in range(0, len(signal), step):
+                det.feed(signal[i:i + step])
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not fired:
+                time.sleep(0.02)
+            det.stop()
+        self.assertEqual(len(fired), 1, "ログの文字コードで検出ごと死んでいる")
+
+
+class DictationSegmenterTest(unittest.TestCase):
+    """連続口述モードの設定(黙るまでが1発話 / 途中で切らない)の検証。"""
+
+    def setUp(self):
+        self.segments = []
+
+    def _make(self, **kw):
+        opts = dict(
+            silence_hold_sec=0.7,
+            min_speech_sec=0.5,
+            max_segment_sec=60.0,
+            check_interval_sec=None,   # 途中で区切らない
+            queue_size=8,
+        )
+        opts.update(kw)
+        return wake_listener.SpeechSegmenter(
+            lambda audio: self.segments.append(len(audio) / wake_listener.SAMPLE_RATE),
+            **opts,
+        )
+
+    def _feed(self, seg, signal, block_sec=0.1):
+        step = int(block_sec * wake_listener.SAMPLE_RATE)
+        for i in range(0, len(signal), step):
+            seg.feed(signal[i:i + step])
+
+    def _wait(self, timeout=2.0):
+        deadline = time.time() + timeout
+        stable, last = 0, None
+        while time.time() < deadline:
+            stable = stable + 1 if len(self.segments) == last else 0
+            if stable >= 2:
+                return
+            last = len(self.segments)
+            time.sleep(0.03)
+
+    def test_each_pause_produces_one_segment(self):
+        # 喋る → 黙る → 喋る → 黙る で 2 回貼られること
+        seg = self._make()
+        seg.start()
+        self._feed(seg, np.concatenate([
+            _tone(1.0, 0.2), _silence(1.0),
+            _tone(1.0, 0.2), _silence(1.0),
+        ]))
+        self._wait()
+        seg.stop()
+        self.assertEqual(len(self.segments), 2, "無音ごとに1発話にならない")
+
+    def test_short_pause_does_not_split(self):
+        # 0.3 秒の「間」では切らない(silence_hold_sec=0.7 未満なので同じ発話)
+        seg = self._make()
+        seg.start()
+        self._feed(seg, np.concatenate([
+            _tone(1.0, 0.2), _silence(0.3), _tone(1.0, 0.2), _silence(1.2),
+        ]))
+        self._wait()
+        seg.stop()
+        self.assertEqual(len(self.segments), 1, "文中の短い間で切れている")
+
+    def test_long_speech_is_not_chopped_mid_sentence(self):
+        # check_interval_sec=None なので、黙るまでは何秒喋っても1発話のまま
+        seg = self._make()
+        seg.start()
+        self._feed(seg, _tone(6.0, 0.2))
+        self._wait(timeout=1.0)
+        seg.stop()
+        self.assertEqual(self.segments, [], "黙っていないのに途中で貼られている")
+
+    def test_backlog_is_reported_not_silently_dropped(self):
+        # 文字起こしが詰まって捨てるときは必ずログに出す(黙って消えるのが最悪)
+        logs = []
+        seg = self._make(queue_size=1, log=logs.append)
+        seg._enabled = True          # worker は動かさずキューだけ埋める
+        for _ in range(3):
+            self._feed(seg, np.concatenate([_tone(1.0, 0.2), _silence(1.0)]))
+        self.assertTrue(any("捨てました" in m for m in logs), "取りこぼしが無言で消えている")
 
 
 if __name__ == "__main__":

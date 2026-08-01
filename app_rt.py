@@ -17,15 +17,17 @@ from PySide6.QtWidgets import QApplication, QWidget, QLabel, QSystemTrayIcon, QM
 from pynput import keyboard as pynput_keyboard
 
 from core import VoiceCore, SAMPLE_RATE
-from wake_listener import WakeDetector, rms, SPEECH_RMS
+from wake_listener import WakeDetector, SpeechSegmenter, rms, safe_log, SPEECH_RMS
 
 IDLE, LOADING, RECORDING, BUSY = "idle", "loading", "recording", "busy"
+SESSION = "session"                    # 連続口述セッション中(喋る→黙る→貼る の繰り返し)
 LISTENING = "listening"                # ウェイクワード待受中(state ではなく IDLE の表示色)
 COLORS = {
     IDLE: QColor("#2d7dd2"),
     LOADING: QColor("#868e96"),
     RECORDING: QColor("#e03131"),
     BUSY: QColor("#f08c00"),
+    SESSION: QColor("#e03131"),
     LISTENING: QColor("#2f9e44"),
 }
 HOTKEY = "<ctrl>+<alt>+<space>"        # 生口述(録音 開始/停止)
@@ -69,15 +71,14 @@ PREVIEW_INTERVAL = 0.2     # 暫定変換の最短間隔(秒)。変換が速け�
 MAX_PREVIEW_CHARS = 120    # プレビューに表示する末尾文字数(あふれ防止)
 PREVIEW_MODEL = "small"    # 暫定モデル。"tiny" にすると更に高速(精度は落ちる/確定で直る)
 
-# ウェイクワードで始まった録音を自動で止める条件(手で止めなくて済むようにするため)
-# 手押しのときは Enter/ボタンで即座に止まるので、ここの待ち時間がそのまま
-# 「喋り終わってから貼られるまで」の体感差になる。短くするほど速いが、
-# 文の途中の「間」で切られやすくなるトレードオフ。
-AUTO_STOP_SILENCE_SEC = 1.0   # 喋り終わってからこれだけ無音が続いたら確定する
-SILENCE_TAIL_SEC = 0.15       # 無音判定に使う直近音声の長さ(長いほど判定が遅れる)
-WATCHDOG_POLL_SEC = 0.1       # 無音チェックの間隔
-WAKE_START_GRACE_SEC = 5.0    # 起動後この時間まったく喋らなければ空振りとして終了する
-MAX_RECORD_SEC = 120.0        # 保険。何かの拍子に止まらなくなっても必ず打ち切る
+# ===== 連続口述セッション(ウェイクワードで始まり、喋る→黙る→貼る を繰り返す) =====
+# ここの無音の長さがそのまま「喋り終わってから貼られるまで」の体感になる。
+# 短いほど自然だが、文の途中の「間」で区切られて細切れに貼られやすくなる。
+DICTATE_SILENCE_SEC = 0.7      # これだけ黙ったら、そこまでを1つの発話として貼り付ける
+MIN_UTTERANCE_SEC = 0.5        # これより短い音は貼らない(相槌・物音で貼られないように)
+MAX_UTTERANCE_SEC = 60.0       # 1発話の上限(区切らず喋り続けた場合の保険)
+SESSION_IDLE_TIMEOUT_SEC = 30.0  # 何も喋らないままこの時間たったらセッションを終える
+UTTERANCE_QUEUE = 8            # 文字起こし待ちの発話をためておける数
 
 
 def apply_noactivate(widget):
@@ -168,12 +169,23 @@ class MicButton(QWidget):
         # ウェイクワード待受: small モデルを暫定プレビューと共用するため排他する
         self._model_lock = threading.Lock()
         self.wake_on = False
-        self._wake_session = False   # 今の録音がウェイクワード起動かどうか
+        self._session_last_voice = 0.0
         self._wake = WakeDetector(
             transcribe=self._wake_transcribe,
             on_wake=lambda: self.notify.emit("__wake__"),
             sample_rate=SAMPLE_RATE,
-            log=print,
+            log=safe_log,
+        )
+        # 連続口述: 喋り終わりの無音で区切り、区間ごとに確定 → 貼り付け
+        self._dictate = SpeechSegmenter(
+            self._on_utterance,
+            sample_rate=SAMPLE_RATE,
+            silence_hold_sec=DICTATE_SILENCE_SEC,
+            min_speech_sec=MIN_UTTERANCE_SEC,
+            max_segment_sec=MAX_UTTERANCE_SEC,
+            check_interval_sec=None,   # 途中で区切らない(黙るまでが1発話)
+            queue_size=UTTERANCE_QUEUE,
+            log=safe_log,
         )
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -182,6 +194,7 @@ class MicButton(QWidget):
         self.setToolTip(
             "クリック / Ctrl+Alt+Space = 録音 開始/停止\n"
             "Ctrl+Alt+L = ウェイクワード待受(「やっほークロード」)の ON/OFF\n"
+            "緑 = 待受中 / 赤 = 連続口述中(喋ると貼られます)\n"
             "録音中は Enter でも停止できます\n"
             "右クリック = メニュー"
         )
@@ -220,14 +233,16 @@ class MicButton(QWidget):
     # ---- ウェイクワード待受 ----
     def set_wake_mode(self, on):
         if on and self.state == LOADING:
-            print("[wake] モデルのロード中は待受を開始できません")
+            safe_log("[wake] モデルのロード中は待受を開始できません")
             return
         self.wake_on = bool(on)
         if self.wake_on:
             self._start_listening()
+        elif self.state == SESSION:
+            self._end_session()   # 口述中に OFF にされたらセッションごと畳む
         else:
             self._stop_listening()
-        print(f"[wake] 待受 {'ON' if self.wake_on else 'OFF'}")
+        safe_log(f"[wake] 待受 {'ON' if self.wake_on else 'OFF'}")
 
     def _start_listening(self):
         """IDLE のときだけマイク監視を開く(録音中は録音側がマイクを使う)。"""
@@ -237,7 +252,7 @@ class MicButton(QWidget):
             self._wake.start()
             self.core.start_monitor(self._wake.feed)
         except Exception as e:
-            print(f"[wake] マイク監視を開始できませんでした: {e}")
+            safe_log(f"[wake] マイク監視を開始できませんでした: {e}")
             self._wake.stop()
             self.wake_on = False
         self.update()
@@ -251,36 +266,64 @@ class MicButton(QWidget):
         with self._model_lock:
             return self.core.transcribe_preview(audio)
 
-    def _silence_watchdog(self):
-        """ウェイクワードで始まった録音を、喋り終わりの無音で自動確定する。"""
-        started = time.time()
-        last_voice = started
-        spoke = False
-        tail_samples = int(SAMPLE_RATE * SILENCE_TAIL_SEC)
-        while self.state == RECORDING and self._wake_session:
-            time.sleep(WATCHDOG_POLL_SEC)
-            audio = self.core.snapshot_audio()
-            if audio is not None and len(audio):
-                if rms(audio[-tail_samples:]) >= SPEECH_RMS:
-                    last_voice = time.time()
-                    spoke = True
-            now = time.time()
-            limit = AUTO_STOP_SILENCE_SEC if spoke else WAKE_START_GRACE_SEC
-            if now - last_voice >= limit or now - started >= MAX_RECORD_SEC:
-                self.notify.emit("__toggle__")
+    # ---- 連続口述セッション ----
+    def _start_session(self):
+        """ウェイクワード検出後、黙るまでを1発話として貼り続けるモードに入る。
+
+        マイクは待受のまま使い続ける(閉じて開き直さないので発話の頭が欠けない)。
+        渡し先だけウェイク判定 → 口述に差し替える。
+        """
+        self._wake.stop()
+        self._dictate.start()
+        self.core.start_monitor(self._dictate_feed)
+        self._session_last_voice = time.time()
+        self.state_changed.emit(SESSION)
+        threading.Thread(target=self._session_watchdog, daemon=True).start()
+        safe_log("[session] 開始: 喋る → 黙る → 貼り付け。止めるにはボタン/Ctrl+Alt+Space")
+
+    def _end_session(self):
+        self._dictate.stop()
+        if not self.wake_on:
+            self.core.stop_monitor()
+        safe_log("[session] 終了")
+        self.state_changed.emit(IDLE)  # 待受 ON なら _on_state が待受を再開する
+
+    def _dictate_feed(self, block):
+        """口述セッション中の音声ブロック。無音タイムアウト用に最後の発話時刻も見る。"""
+        if rms(block) >= SPEECH_RMS:
+            self._session_last_voice = time.time()
+        self._dictate.feed(block)
+
+    def _on_utterance(self, audio):
+        """1発話ぶんの音声を確定して貼り付ける(SpeechSegmenter のスレッドで直列実行)。"""
+        t_start = time.time()
+        with self._model_lock:
+            text = self.core.transcribe(audio)
+        t_text = time.time()
+        if text:
+            self.core.deliver(text)
+        safe_log(f"[timing] 音声 {len(audio) / SAMPLE_RATE:.1f}s / "
+              f"確定 {t_text - t_start:.2f}s / 貼付 {time.time() - t_text:.2f}s")
+
+    def _session_watchdog(self):
+        """しばらく何も喋らなければセッションを終える(言いっぱなしの放置対策)。"""
+        while self.state == SESSION:
+            time.sleep(0.5)
+            if time.time() - self._session_last_voice >= SESSION_IDLE_TIMEOUT_SEC:
+                self.notify.emit("__end_session__")
                 return
 
     # ---- 録音トグル ----
     def toggle(self):
         if self.state == LOADING:
             return
-        if self.state == IDLE:
+        if self.state == SESSION:
+            self._end_session()
+        elif self.state == IDLE:
             self._stop_listening()   # 録音と待受で同じマイクを取り合わないよう先に閉じる
             self.core.start_recording()
             self.state_changed.emit(RECORDING)
             self._start_preview()
-            if self._wake_session:
-                threading.Thread(target=self._silence_watchdog, daemon=True).start()
         elif self.state == RECORDING:
             self._preview_running = False
             self.state_changed.emit(BUSY)
@@ -321,10 +364,9 @@ class MicButton(QWidget):
                 self.core.deliver(text)
             # 遅く感じたときにどこが重いかを当てずっぽうでなく数字で見るためのログ。
             # 「喋り終わり → 貼り付け」の体感 = AUTO_STOP_SILENCE_SEC + 確定 + 貼付。
-            print(f"[timing] 音声 {len(audio) / SAMPLE_RATE:.1f}s / "
+            safe_log(f"[timing] 音声 {len(audio) / SAMPLE_RATE:.1f}s / "
                   f"確定 {t_text - t_stop:.2f}s / 貼付 {time.time() - t_text:.2f}s")
         finally:
-            self._wake_session = False
             self.preview_text.emit("__hide__")
             self.state_changed.emit(IDLE)  # 待受 ON なら _on_state がマイク監視を再開する
 
@@ -379,12 +421,14 @@ class MicButton(QWidget):
         elif msg == "__wake_toggle__":
             self.set_wake_mode(not self.wake_on)
         elif msg == "__wake__":
-            # ウェイクワード検出。この時点で待受は自分で止まっているので録音へ移る。
+            # ウェイクワード検出。この時点で待受は自分で止まっている。
             if self.state == IDLE:
-                self._wake_session = True
-                self.toggle()
+                self._start_session()
             else:
                 self._start_listening()  # 録音中などに来たら無視して待受へ戻す
+        elif msg == "__end_session__":
+            if self.state == SESSION:
+                self._end_session()
 
     # ---- 描画 ----
     def paintEvent(self, event):
@@ -399,7 +443,8 @@ class MicButton(QWidget):
         p.drawEllipse(m, m, self.width() - 2 * m, self.height() - 2 * m)
 
         cx, cy = self.width() // 2, self.height() // 2
-        if self.state == IDLE:
+        if self.state in (IDLE, SESSION):
+            # SESSION は赤地にマイク = 「今喋ったら貼られる」状態
             self._draw_mic(p, cx, cy)
         else:
             p.setPen(QColor("white"))

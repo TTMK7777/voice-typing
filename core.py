@@ -147,10 +147,15 @@ class VoiceCore:
     # 録音を始める前に必ず stop_monitor() で閉じる(GUI 側が保証)。
     # 受け取った音声はメモリ上のバッファのみで、保存も送信もしない。
     def start_monitor(self, on_block):
-        """マイクの常時監視を開始し、音声ブロックを on_block(np.ndarray) に渡す。"""
+        """マイクの常時監視を開始し、音声ブロックを on_block(np.ndarray) に渡す。
+
+        すでに監視中なら**ストリームは開いたまま渡し先だけ差し替える**。
+        ウェイクワード待受 → 連続口述の切り替えでマイクを閉じて開き直すと、
+        その間の音が落ちて発話の頭が欠けるため。
+        """
+        self._monitor_cb = on_block
         if self._monitor_stream is not None:
             return
-        self._monitor_cb = on_block
         self._monitor_stream = sd.InputStream(
             samplerate=SAMPLE_RATE, channels=1, dtype="float32",
             blocksize=int(SAMPLE_RATE * MONITOR_BLOCK_SEC),
