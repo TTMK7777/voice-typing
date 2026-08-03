@@ -17,7 +17,7 @@ from PySide6.QtWidgets import QApplication, QWidget, QLabel, QSystemTrayIcon, QM
 from pynput import keyboard as pynput_keyboard
 
 from core import VoiceCore, SAMPLE_RATE
-from wake_listener import WakeDetector, SpeechSegmenter, rms, safe_log, SPEECH_RMS
+from wake_listener import WakeDetector, SpeechSegmenter, safe_log
 
 IDLE, LOADING, RECORDING, BUSY = "idle", "loading", "recording", "busy"
 SESSION = "session"                    # 連続口述セッション中(喋る→黙る→貼る の繰り返し)
@@ -169,7 +169,6 @@ class MicButton(QWidget):
         # ウェイクワード待受: small モデルを暫定プレビューと共用するため排他する
         self._model_lock = threading.Lock()
         self.wake_on = False
-        self._session_last_voice = 0.0
         self._wake = WakeDetector(
             transcribe=self._wake_transcribe,
             on_wake=lambda: self.notify.emit("__wake__"),
@@ -228,6 +227,9 @@ class MicButton(QWidget):
         # 暫定用(small)→ 確定用(large-v3)の順でロード
         self.core.load_preview_model(PREVIEW_MODEL)
         self.core.load_model()
+        # VAD も先に読み込む(音声が流れ始めてから引くとコールバックが詰まる)
+        self._wake.preload()
+        self._dictate.preload()
         self.state_changed.emit(IDLE)
 
     # ---- ウェイクワード待受 ----
@@ -275,24 +277,19 @@ class MicButton(QWidget):
         """
         self._wake.stop()
         self._dictate.start()
-        self.core.start_monitor(self._dictate_feed)
-        self._session_last_voice = time.time()
+        self.core.start_monitor(self._dictate.feed)
+        self._show_preview("聞いています…")
         self.state_changed.emit(SESSION)
         threading.Thread(target=self._session_watchdog, daemon=True).start()
         safe_log("[session] 開始: 喋る → 黙る → 貼り付け。止めるにはボタン/Ctrl+Alt+Space")
 
     def _end_session(self):
         self._dictate.stop()
+        self.preview.hide()
         if not self.wake_on:
             self.core.stop_monitor()
         safe_log("[session] 終了")
         self.state_changed.emit(IDLE)  # 待受 ON なら _on_state が待受を再開する
-
-    def _dictate_feed(self, block):
-        """口述セッション中の音声ブロック。無音タイムアウト用に最後の発話時刻も見る。"""
-        if rms(block) >= SPEECH_RMS:
-            self._session_last_voice = time.time()
-        self._dictate.feed(block)
 
     def _on_utterance(self, audio):
         """1発話ぶんの音声を確定して貼り付ける(SpeechSegmenter のスレッドで直列実行)。"""
@@ -301,7 +298,10 @@ class MicButton(QWidget):
             text = self.core.transcribe(audio)
         t_text = time.time()
         if text:
+            self.preview_text.emit(text)
             self.core.deliver(text)
+        else:
+            self.preview_text.emit("(認識できませんでした)")
         # 「喋り終わってから貼られるまで」の体感 = DICTATE_SILENCE_SEC + 確定 + 貼付。
         # 貼付にクリップボード復元待ちは含まない(別スレッドへ回してあるため)。
         safe_log(f"[timing] 音声 {len(audio) / SAMPLE_RATE:.1f}s / "
@@ -312,7 +312,8 @@ class MicButton(QWidget):
         """しばらく何も喋らなければセッションを終える(言いっぱなしの放置対策)。"""
         while self.state == SESSION:
             time.sleep(0.5)
-            if time.time() - self._session_last_voice >= SESSION_IDLE_TIMEOUT_SEC:
+            idle = time.monotonic() - self._dictate.last_speech_at
+            if idle >= SESSION_IDLE_TIMEOUT_SEC:
                 self.notify.emit("__end_session__")
                 return
 
@@ -332,11 +333,14 @@ class MicButton(QWidget):
             self.state_changed.emit(BUSY)
             threading.Thread(target=self._finish, daemon=True).start()
 
-    def _start_preview(self):
-        self.preview.set_text("")
+    def _show_preview(self, text=""):
+        self.preview.set_text(text)
         if not self.preview.user_moved:
             self.preview.place_above(self.frameGeometry())
         self.preview.show()
+
+    def _start_preview(self):
+        self._show_preview("")
         self._preview_running = True
         threading.Thread(target=self._preview_loop, daemon=True).start()
 

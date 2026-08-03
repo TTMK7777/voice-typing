@@ -17,12 +17,29 @@
 import queue
 import sys
 import threading
+import time
 
 import numpy as np
 
 from wake_word import is_wake
 
 SAMPLE_RATE = 16000
+
+# ===== 発話判定(Silero VAD) =====
+# faster-whisper に同梱されている Silero VAD(ONNX/CPU)を使う。追加依存はない。
+#
+# 当初は音量(RMS)で判定していたが、マイクによっては成立しない。内蔵 AGC が
+# 無音時にゲインを上げるため、暗騒音が発話と同じ音量まで持ち上がるため。
+# 実測(2026-08-04): RMS は 無音の最大 0.0856 と 発話の中央値 0.0411 が重なって
+# 分離不能だったのに対し、VAD 確率は 無音 0.044〜0.057 / 発話 0.86〜0.98 と
+# 15 倍以上開いた。推論は 1 フレーム 0.13ms(CPU 占有 0.1%)。
+CHUNK_SAMPLES = 512                       # Silero の 1 フレーム(32ms @ 16kHz)
+VAD_FRAME_CHUNKS = 3                      # まとめて 1 回推論する数
+FRAME_SAMPLES = CHUNK_SAMPLES * VAD_FRAME_CHUNKS   # 1536 = 96ms
+VAD_SPEECH_PROB = 0.5                     # これ以上なら発話
+VAD_SILENCE_PROB = 0.35                   # これ未満なら無音(間は直前の判定を維持=ヒステリシス)
+
+_VAD_LOCK = threading.Lock()              # ONNX セッションは共有なので直列化する
 
 
 def safe_log(message):
@@ -40,9 +57,6 @@ def safe_log(message):
     except Exception:
         pass  # pythonw 起動などで stdout が無い場合。ログのために機能を止めない
 
-# 発話とみなす音量(float32 の RMS)。下げると拾いやすく、上げると誤検知が減る。
-SPEECH_RMS = 0.012
-
 # ===== ウェイクワード待受のパラメータ =====
 WAKE_SILENCE_HOLD_SEC = 0.5     # 無音がこれだけ続いたら区間の終わり
 WAKE_MIN_SPEECH_SEC = 0.35      # これより短い区間は無視(咳払い・クリック音)
@@ -53,10 +67,51 @@ WAKE_CHECK_INTERVAL_SEC = 1.0   # 発話が続いていてもこの間隔で判�
 
 
 def rms(block):
-    """音声ブロックの実効値。空なら 0.0。"""
+    """音声ブロックの実効値。空なら 0.0。
+
+    発話判定には使わない(上のコメント参照)。音量を表示・記録したいときのため残している。
+    """
     if block is None or len(block) == 0:
         return 0.0
     return float(np.sqrt(np.mean(np.square(block, dtype=np.float64))))
+
+
+class SileroSpeechDetector:
+    """1 フレーム(96ms)が発話かどうかを Silero VAD で判定する。
+
+    音声もモデルもすべてローカル。ネットワークには触れない。
+    """
+
+    def __init__(self, speech_prob=VAD_SPEECH_PROB, silence_prob=VAD_SILENCE_PROB):
+        self._model = None
+        self._speech_prob = speech_prob
+        self._silence_prob = silence_prob
+        self._in_speech = False
+        self.last_prob = 0.0
+
+    def load(self):
+        """モデルを先に読み込む(初回だけ ~50ms。音声処理中に引きたくないので明示的に呼ぶ)。"""
+        with _VAD_LOCK:
+            if self._model is None:
+                from faster_whisper.vad import get_vad_model
+                self._model = get_vad_model()
+
+    def reset(self):
+        self._in_speech = False
+
+    def is_speech(self, frame):
+        if self._model is None:
+            self.load()
+        with _VAD_LOCK:
+            prob = float(self._model(frame).max())
+        self.last_prob = prob
+        # ヒステリシス: 中間の確率では直前の判定を維持し、語中の一瞬の落ち込みで
+        # 発話が切れないようにする。
+        if prob >= self._speech_prob:
+            self._in_speech = True
+        elif prob < self._silence_prob:
+            self._in_speech = False
+        return self._in_speech
 
 
 class SpeechSegmenter:
@@ -71,9 +126,15 @@ class SpeechSegmenter:
                  min_speech_sec=WAKE_MIN_SPEECH_SEC,
                  max_segment_sec=WAKE_MAX_SEGMENT_SEC,
                  check_interval_sec=None,
-                 queue_size=2, log=None):
+                 queue_size=2, log=None, is_speech=None):
         self._on_segment = on_segment
         self._sr = sample_rate
+        # フレームが発話かどうかの判定。既定は Silero VAD。
+        # テストでは差し替えて、区切りの状態機械だけを検証する。
+        self._detector = None if is_speech else SileroSpeechDetector()
+        self._is_speech = is_speech or self._detector.is_speech
+        self._pending = np.zeros(0, dtype=np.float32)
+        self.last_speech_at = 0.0
         self._silence_hold_sec = silence_hold_sec
         self._min_samples = int(min_speech_sec * sample_rate)
         self._max_samples = int(max_segment_sec * sample_rate)
@@ -97,6 +158,11 @@ class SpeechSegmenter:
     def enabled(self):
         return self._enabled
 
+    def preload(self):
+        """VAD モデルを先に読み込む(音声が流れ始めてから引かないように)。"""
+        if self._detector is not None:
+            self._detector.load()
+
     def start(self):
         # 直前の worker が終了しかけている場合がある(検出直後など)ので待つ。
         # ここで「生きているから」と早期 return すると _enabled が False のままになり、
@@ -106,6 +172,11 @@ class SpeechSegmenter:
             self._wake_worker()
             self._thread.join(timeout=1.0)
         self._reset()
+        self._pending = np.zeros(0, dtype=np.float32)
+        if self._detector is not None:
+            self._detector.reset()
+        # 一度も喋らないまま無音判定されないよう、開始時刻を入れておく
+        self.last_speech_at = time.monotonic()
         self._drain()
         self._enabled = True
         self._thread = threading.Thread(target=self._worker, daemon=True)
@@ -130,15 +201,25 @@ class SpeechSegmenter:
             except queue.Empty:
                 return
 
-    # ---- オーディオコールバックから呼ばれる(軽い処理のみ) ----
+    # ---- オーディオコールバックから呼ばれる ----
+    # VAD は 1 フレーム 0.13ms(実測)なので、ここで回してもコールバックを詰まらせない。
     def feed(self, block):
         if not self._enabled:
             return
+        # Silero は 512 サンプル単位でしか食べないので、固定長フレームに切り直す
+        self._pending = np.concatenate([self._pending, block])
+        while len(self._pending) >= FRAME_SAMPLES:
+            frame = self._pending[:FRAME_SAMPLES]
+            self._pending = self._pending[FRAME_SAMPLES:]
+            self._feed_frame(frame)
+
+    def _feed_frame(self, block):
         duration = len(block) / self._sr
-        if rms(block) >= SPEECH_RMS:
+        if self._is_speech(block):
             self._in_speech = True
             self._silence_sec = 0.0
             self._voiced_samples += len(block)
+            self.last_speech_at = time.monotonic()
             self._append(block)
             if self._check_interval_sec is not None:
                 self._since_check_sec += duration
@@ -190,7 +271,8 @@ class WakeDetector:
     on_wake:    () -> None
     """
 
-    def __init__(self, transcribe, on_wake, sample_rate=SAMPLE_RATE, log=None):
+    def __init__(self, transcribe, on_wake, sample_rate=SAMPLE_RATE, log=None,
+                 is_speech=None):
         self._transcribe = transcribe
         self._on_wake = on_wake
         self._log = log or (lambda msg: None)
@@ -202,7 +284,11 @@ class WakeDetector:
             max_segment_sec=WAKE_MAX_SEGMENT_SEC,
             check_interval_sec=WAKE_CHECK_INTERVAL_SEC,
             log=log,
+            is_speech=is_speech,
         )
+
+    def preload(self):
+        self._segmenter.preload()
 
     @property
     def enabled(self):

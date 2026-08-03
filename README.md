@@ -64,7 +64,9 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1
 - **止め方**: マイクボタンをクリック / `Ctrl+Alt+Space` / 30 秒何も喋らない
 - 赤の間は `Enter` を遮断しません。貼り付いた文をそのまま `Enter` で送信できます
   (手押し録音のときだけは、誤送信防止のため録音中の `Enter` を遮断します)
-- 何を拾って何と判定したかは黒窓に出ます(`run_gui.bat` 起動時)
+- 認識したテキストはパネルに表示されてから貼られます(何が入力されるか目で確認できます)
+- 何を拾って何と判定したかは黒窓に出ます。**デスクトップ/タスクバーのアイコンから起動すると
+  黒窓が無いのでログが見えません。**うまく動かないときは `run_gui.bat` から起動してください
 
 ```
 [wake] 'やっほーくろーど' -> HIT
@@ -107,7 +109,7 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1
 | ホットキーを変える | `app_rt.py` / `app.py` の `HOTKEY` / `WAKE_HOTKEY` |
 | 新しい幻覚フレーズを消す | `core.py` の `HALLUCINATIONS` に1行追加 |
 | ウェイクワードを変える | `wake_word.py` の `_WAKE_RE`(表記揺れを吸収するため正規化後のパターン) |
-| ウェイクワードが拾われにくい/誤発火する | `wake_listener.py` の `SPEECH_RMS`(下げると拾いやすく、上げると誤発火が減る) |
+| 発話の拾い始め/切れ目が合わない | `wake_listener.py` の `VAD_SPEECH_PROB` / `VAD_SILENCE_PROB`(Silero VAD の確率しきい値) |
 | 喋り終わりから貼られるまでの間 | `app_rt.py` の `DICTATE_SILENCE_SEC`(既定 0.5 秒。短いほど速いが文中の「間」で細切れに貼られやすい) |
 | 口述セッションが自動で終わるまでの時間 | `app_rt.py` の `SESSION_IDLE_TIMEOUT_SEC`(既定 30 秒) |
 
@@ -118,7 +120,7 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1
 | `core.py` | 録音・文字起こし・貼り付け・幻覚除去・音声コマンド・ウェイクワード用のマイク監視。**OS に触れる処理は全部ここ** |
 | `app_rt.py` | GUI 本体(フローティングボタン + リアルタイムプレビュー)。`core.py` を呼ぶ |
 | `wake_word.py` | ウェイクワードの判定(文字列だけ。OS・マイク・GPU に触れない) |
-| `wake_listener.py` | 発話区間の切り出しとウェイク判定の呼び出し(マイクは持たず、`core.py` から音声ブロックを受け取る) |
+| `wake_listener.py` | 発話区間の切り出し(Silero VAD)とウェイク判定の呼び出し(マイクは持たず、`core.py` から音声ブロックを受け取る) |
 | `app.py` | ボタンのみの簡易 GUI(プレビューなし)。同じく `core.py` を呼ぶ |
 | `cuda_setup.py` | CUDA DLL のパス登録(faster-whisper の GPU 動作に必須) |
 | `vocab.txt` | 認識のヒント語彙(`vocab.example.txt` をコピーして作る) |
@@ -140,6 +142,7 @@ GUI は 2 つとも `core.py` の `VoiceCore` を呼ぶだけで、独自に録�
 ## 構成技術
 
 - 文字起こし: faster-whisper（確定=`large-v3` / リアルタイム暫定=`small`、GPU/CUDA）
+- 発話区間の検出: Silero VAD（faster-whisper 同梱、ONNX/CPU。追加依存なし）
 - GUI: PySide6（フォーカスを奪わない `WS_EX_NOACTIVATE` ウィンドウ）
 - 入力送出: pyperclip（クリップボード）+ pynput（ホットキー / キーストローク）
 
