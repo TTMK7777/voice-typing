@@ -331,6 +331,38 @@ class SafeLogTest(unittest.TestCase):
         self.assertEqual(len(fired), 1, "ログの文字コードで検出ごと死んでいる")
 
 
+class PrerollTest(unittest.TestCase):
+    """VAD が「発話」と気づく前のフレームも、さかのぼって発話に含めること。
+
+    VAD の判定は語頭がある程度入ってから立ち上がるため、これが無いと語頭が欠け、
+    Whisper がその発話を拾い損ねる(実機で「たまに聞き取らない」として出た)。
+    """
+
+    def test_segment_starts_before_the_speech_onset(self):
+        captured = []
+        seg = wake_listener.SpeechSegmenter(
+            captured.append,
+            silence_hold_sec=0.7, min_speech_sec=0.5, max_segment_sec=60.0,
+            check_interval_sec=None, queue_size=8, is_speech=_loud_is_speech,
+        )
+        seg.start()
+        signal = np.concatenate([_silence(1.0), _tone(1.0, 0.2), _silence(1.5)])
+        step = int(0.1 * wake_listener.SAMPLE_RATE)
+        for i in range(0, len(signal), step):
+            seg.feed(signal[i:i + step])
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not captured:
+            time.sleep(0.02)
+        seg.stop()
+
+        self.assertTrue(captured, "発話区間が切り出されていない")
+        head = captured[0][:wake_listener.FRAME_SAMPLES]
+        self.assertLess(
+            wake_listener.rms(head), 0.001,
+            "発話の頭から始まっている = さかのぼり(preroll)が効いていない",
+        )
+
+
 class LastSpeechAtTest(unittest.TestCase):
     """`last_speech_at` は口述セッションの無音タイムアウト判定に使う。
 

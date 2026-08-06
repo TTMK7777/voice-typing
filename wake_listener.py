@@ -14,6 +14,7 @@
 
 音声はメモリ上のバッファのみで、保存も送信もしない。
 """
+import collections
 import queue
 import sys
 import threading
@@ -38,6 +39,11 @@ VAD_FRAME_CHUNKS = 3                      # まとめて 1 回推論する数
 FRAME_SAMPLES = CHUNK_SAMPLES * VAD_FRAME_CHUNKS   # 1536 = 96ms
 VAD_SPEECH_PROB = 0.5                     # これ以上なら発話
 VAD_SILENCE_PROB = 0.35                   # これ未満なら無音(間は直前の判定を維持=ヒステリシス)
+
+# VAD が「発話」と気づく前のフレームも、さかのぼって発話に含める数。
+# VAD の判定は語頭がある程度入ってから立ち上がるため、これが無いと
+# 「〜です」の「〜」が欠けて Whisper が拾い損ねる(実機で「漏れる」として現れた)。
+PREROLL_FRAMES = 3                        # 96ms × 3 = 288ms さかのぼる
 
 _VAD_LOCK = threading.Lock()              # ONNX セッションは共有なので直列化する
 
@@ -147,6 +153,7 @@ class SpeechSegmenter:
 
     # ---- 状態 ----
     def _reset(self):
+        self._preroll = collections.deque(maxlen=PREROLL_FRAMES)
         self._segment = []
         self._segment_samples = 0
         self._voiced_samples = 0
@@ -216,6 +223,12 @@ class SpeechSegmenter:
     def _feed_frame(self, block):
         duration = len(block) / self._sr
         if self._is_speech(block):
+            if not self._in_speech:
+                # 語頭が欠けないよう、VAD が気づく前のフレームもさかのぼって入れる。
+                # voiced にはカウントしない(最小発話長の判定を甘くしないため)。
+                for earlier in self._preroll:
+                    self._append(earlier)
+                self._preroll.clear()
             self._in_speech = True
             self._silence_sec = 0.0
             self._voiced_samples += len(block)
@@ -233,6 +246,8 @@ class SpeechSegmenter:
             if self._silence_sec >= self._silence_hold_sec:
                 self._submit()
                 self._reset()
+        else:
+            self._preroll.append(block)   # 次の発話の語頭用に直前を持っておく
 
     def _append(self, block):
         if self._segment_samples < self._max_samples:
