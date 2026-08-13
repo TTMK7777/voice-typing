@@ -102,7 +102,7 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1
 
 | やりたいこと | 場所 |
 |---|---|
-| よく使う語/誤変換しやすい語を覚えさせる | `vocab.txt`(1行1語。認識のヒントに効く) |
+| よく使う語/誤変換しやすい語を覚えさせる | `vocab.txt`(1行1語。**大事な語ほど下に**書く。下記参照) |
 | プレビュー更新の速さ | `app_rt.py` の `PREVIEW_INTERVAL`(小さいほど速い) |
 | プレビューを更に高速化 | `app_rt.py` の `PREVIEW_MODEL = "tiny"` |
 | プレビュー表示文字数 | `app_rt.py` の `MAX_PREVIEW_CHARS` |
@@ -112,6 +112,18 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1
 | 発話の拾い始め/切れ目が合わない | `wake_listener.py` の `VAD_SPEECH_PROB` / `VAD_SILENCE_PROB`(Silero VAD の確率しきい値) |
 | 喋り終わりから貼られるまでの間 | `app_rt.py` の `DICTATE_SILENCE_SEC`(既定 0.5 秒。短いほど速いが文中の「間」で細切れに貼られやすい) |
 | 口述セッションが自動で終わるまでの時間 | `app_rt.py` の `SESSION_IDLE_TIMEOUT_SEC`(既定 30 秒) |
+
+### 固有名詞が誤変換されるとき
+
+`vocab.txt` に足すのが唯一効く手です。文脈を長くしても直りません
+(実測: 「山王病院に行きます」だけでも、前後に文を足した長い発話でも同じく `産脳病院` /
+`三能病院` になり、`vocab.txt` に 1 語足した時だけ `山王病院` になった)。
+
+**`vocab.txt` には上限があります**。Whisper は認識ヒントの**末尾 223 トークン**しか読まず、
+あふれた先頭は警告なく捨てます。日本語の固有名詞は 1 語あたり約 5 トークンなので、
+**入るのは 30 語ほど**です。超えると起動時に `[vocab]` 警告が出るので、
+そうなったら使わない語を消してください。捨てられるのは先頭からなので、
+**よく使う語ほどファイルの下**に書くと生き残ります。
 
 ## ファイル構成
 

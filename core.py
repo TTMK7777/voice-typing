@@ -63,6 +63,16 @@ def match_voice_command(text):
     return None
 
 
+# initial_prompt に入れられるトークン数の上限。
+# Whisper は prompt の**末尾** max_length//2 - 1 トークンだけを使い、あふれた先頭は
+# 警告なく捨てる(faster_whisper/transcribe.py の get_prompt)。捨てられても
+# エラーは出ないので、vocab.txt に語を足し続けると「足したのに効かない」「先に
+# 句読点誘導文だけ消える」が無言で起きる。ここで枠内に収め、落とした語は必ず知らせる。
+#
+# 実測(large-v3 / 2026-08-13): 句読点誘導文だけで 38 トークン、日本語の固有名詞は
+# 1 語あたり約 5 トークン。つまり語彙に使えるのは 30 語ほどが上限。
+PROMPT_TOKEN_LIMIT = 223
+
 # Whisper 日本語の定番幻覚(無音/末尾で混入する学習データ=YouTube字幕由来の定型句)
 HALLUCINATIONS = [
     "最後までご視聴いただきありがとうございました",
@@ -97,28 +107,81 @@ class VoiceCore:
 
     def _load_vocab(self):
         """vocab.txt があれば認識ヒント(initial_prompt)として読み込む。"""
+        words = self._load_vocab_words()
+        return "、".join(words) if words else None
+
+    def _load_vocab_words(self):
+        """vocab.txt の語を1行1語で読む(空行と # 始まりは無視)。無ければ空リスト。"""
         try:
             with open(self.vocab_file, encoding="utf-8") as f:
-                words = [s for s in (line.strip() for line in f) if s and not s.startswith("#")]
-            return "、".join(words) if words else None
+                return [s for s in (line.strip() for line in f)
+                        if s and not s.startswith("#")]
         except FileNotFoundError:
-            return None
+            return []
 
     def reload_vocab(self):
         self.initial_prompt = self._build_prompt()
+
+    def count_tokens(self, text):
+        """text のトークン数。モデル未ロード時は文字数で概算する。
+
+        日本語では文字数がトークン数をわずかに上回る(実測 114 文字 = 108 トークン)
+        ため、概算は安全側(多め)に振れる。
+        """
+        if self.model is not None:
+            try:
+                return len(self.model.hf_tokenizer.encode(
+                    " " + text.strip(), add_special_tokens=False).ids)
+            except Exception:
+                pass  # トークナイザが取れない版でも概算で続行する
+        return len(text)
+
+    def _fit_vocab(self, base, words):
+        """語彙を PROMPT_TOKEN_LIMIT の残り枠に収める。(採用した語, 落とした語) を返す。
+
+        枠を超えた分は Whisper 側で**先頭から**捨てられるので、こちらも先頭から
+        落として挙動を一致させる。結果として vocab.txt の後ろに書いた語ほど残る。
+        句読点誘導文(base)は機能なので必ず確保し、削るのは語彙側だけにする。
+        """
+        head = base + "登場する固有名詞: "
+        budget = PROMPT_TOKEN_LIMIT - self.count_tokens(head + "。")
+        kept = []
+        used = 0
+        for word in reversed(words):
+            cost = self.count_tokens(word + "、")
+            if used + cost > budget:
+                break
+            kept.insert(0, word)
+            used += cost
+        return kept, words[:len(words) - len(kept)]
 
     def _build_prompt(self):
         """句読点を誘導する自然文 + 語彙ヒントを initial_prompt にする。
         Whisper は直前文脈の文体を真似るので、句読点付きの文を渡すと句読点が出やすい。"""
         base = "以下は日本語の音声入力です。句読点を適切に付けて、自然な文章に書き起こします。"
-        vocab = self._load_vocab()
-        if vocab:
-            return base + "登場する固有名詞: " + vocab + "。"
-        return base
+        words = self._load_vocab_words()
+        if not words:
+            return base
+        kept, dropped = self._fit_vocab(base, words)
+        if dropped:
+            # 黙って効かなくなるのが最悪なので、必ず知らせる。全部並べると読めないので
+            # 落ちた語の先頭だけ具体名を出す(どこから切れたかが分かれば直せる)。
+            head = "、".join(dropped[:5])
+            more = f" ほか {len(dropped) - 5} 語" if len(dropped) > 5 else ""
+            print(f"[vocab] {self.vocab_file} が長すぎます。先頭の {len(dropped)} 語は"
+                  f"認識ヒントに入りません: {head}{more}")
+            print(f"[vocab] 効くのは末尾の {len(kept)} 語だけです"
+                  f"(上限 {PROMPT_TOKEN_LIMIT} トークン)。よく使う語を後ろに置いてください。")
+        if not kept:
+            return base
+        return base + "登場する固有名詞: " + "、".join(kept) + "。"
 
     def load_model(self):
         from faster_whisper import WhisperModel
         self.model = WhisperModel(self.model_size, device="cuda", compute_type="float16")
+        # __init__ の時点ではトークナイザが無く文字数の概算だったので、
+        # 実トークン数で組み直す(概算は安全側=多めなので、ここで枠が広がる)。
+        self.reload_vocab()
 
     def _callback(self, indata, frame_count, time_info, status):
         if self.recording:
