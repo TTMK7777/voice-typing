@@ -12,6 +12,7 @@
 """
 import os
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -65,9 +66,33 @@ class SessionTest(unittest.TestCase):
 
         fake._wake.stop.assert_called_once()
         fake._dictate.start.assert_called_once()
-        fake.core.start_monitor.assert_called_once_with(fake._dictate_feed)
+        fake.core.start_monitor.assert_called_once_with(fake._dictate.feed)
         fake.core.stop_monitor.assert_not_called()   # ここで閉じると発話の頭が欠ける
         fake.state_changed.emit.assert_called_once_with(app_rt.SESSION)
+
+    def test_session_shows_and_hides_the_preview_panel(self):
+        # 何が入力されるのか見えないと、拾えているのか判断できない
+        fake = _fake(wake_on=True)
+        with mock.patch.object(app_rt.threading, "Thread"):
+            MicButton._start_session(fake)
+        fake._show_preview.assert_called_once()
+
+        fake2 = _fake(wake_on=True)
+        MicButton._end_session(fake2)
+        fake2.preview.hide.assert_called_once()
+
+    def test_each_utterance_is_shown_before_being_pasted(self):
+        fake = _fake()
+        fake.core.transcribe.return_value = "こんにちは"
+        MicButton._on_utterance(fake, np.zeros(16000, dtype=np.float32))
+        fake.preview_text.emit.assert_called_once_with("こんにちは")
+
+    def test_unrecognized_utterance_says_so_instead_of_staying_blank(self):
+        fake = _fake()
+        fake.core.transcribe.return_value = ""
+        MicButton._on_utterance(fake, np.zeros(16000, dtype=np.float32))
+        fake.preview_text.emit.assert_called_once_with("(認識できませんでした)")
+        fake.core.deliver.assert_not_called()
 
     def test_starting_a_session_launches_the_idle_watchdog(self):
         fake = _fake(wake_on=True)
@@ -93,19 +118,28 @@ class SessionTest(unittest.TestCase):
         fake._end_session.assert_called_once()
         fake._stop_listening.assert_not_called()
 
-    def test_speech_refreshes_the_idle_timer(self):
-        fake = _fake(_session_last_voice=0.0)
-        loud = (0.2 * np.ones(1600)).astype(np.float32)
-        MicButton._dictate_feed(fake, loud)
-        self.assertGreater(fake._session_last_voice, 0.0)
-        fake._dictate.feed.assert_called_once()
+    def test_watchdog_ends_the_session_after_a_long_silence(self):
+        fake = _fake(state=app_rt.SESSION)
+        fake._dictate.last_speech_at = time.monotonic() - app_rt.SESSION_IDLE_TIMEOUT_SEC - 1
+        with mock.patch.object(app_rt.time, "sleep"):
+            MicButton._session_watchdog(fake)
+        fake.notify.emit.assert_called_once_with("__end_session__")
 
-    def test_silence_does_not_refresh_the_idle_timer(self):
-        fake = _fake(_session_last_voice=0.0)
-        quiet = np.zeros(1600, dtype=np.float32)
-        MicButton._dictate_feed(fake, quiet)
-        self.assertEqual(fake._session_last_voice, 0.0)
-        fake._dictate.feed.assert_called_once()  # 無音も segmenter には渡す(区切り判定に要る)
+    def test_watchdog_keeps_the_session_while_speaking(self):
+        # 発話時刻は segmenter が VAD の判定で更新する。音量では更新しない
+        # (暗騒音が大きいマイクだと、音量基準では永遠にタイムアウトしない)
+        fake = _fake(state=app_rt.SESSION)
+        fake._dictate.last_speech_at = time.monotonic()
+        ticks = []
+
+        def sleep(_):
+            ticks.append(1)
+            if len(ticks) >= 3:
+                fake.state = app_rt.IDLE   # セッションが別経路で終わった相当
+
+        with mock.patch.object(app_rt.time, "sleep", side_effect=sleep):
+            MicButton._session_watchdog(fake)
+        fake.notify.emit.assert_not_called()
 
 
 class UtteranceTest(unittest.TestCase):

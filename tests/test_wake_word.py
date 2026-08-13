@@ -11,10 +11,12 @@
 GPU / マイク不要(文字起こしはダミー関数に差し替える)。
 """
 import os
+import pathlib
 import sys
 import time
 import unittest
 import unittest.mock
+import wave
 
 import numpy as np
 
@@ -107,16 +109,30 @@ def _silence(seconds, sample_rate=wake_listener.SAMPLE_RATE):
     return np.zeros(int(seconds * sample_rate), dtype=np.float32)
 
 
+def _loud_is_speech(frame):
+    """テスト用の発話判定(音量で代用)。
+
+    本番は Silero VAD だが、正弦波は当然「音声ではない」と判定される。
+    ここで検証したいのは VAD の精度ではなく「発話区間の切り出しと区切りの状態機械」
+    なので、判定だけ差し替えて状態機械を単体で試験する。
+    VAD 本体は SileroSpeechDetectorTest で別途検証する。
+    """
+    return wake_listener.rms(frame) >= 0.012
+
+
 class RmsTest(unittest.TestCase):
+    """rms() は表示・記録用のヘルパ(発話判定には使わない)。"""
+
     def test_empty_is_zero(self):
         self.assertEqual(wake_listener.rms(None), 0.0)
         self.assertEqual(wake_listener.rms(np.array([], dtype=np.float32)), 0.0)
 
-    def test_silence_is_below_threshold(self):
-        self.assertLess(wake_listener.rms(_silence(0.1)), wake_listener.SPEECH_RMS)
+    def test_silence_is_zero(self):
+        self.assertEqual(wake_listener.rms(_silence(0.1)), 0.0)
 
-    def test_loud_tone_is_above_threshold(self):
-        self.assertGreater(wake_listener.rms(_tone(0.1, 0.2)), wake_listener.SPEECH_RMS)
+    def test_matches_theoretical_value_for_a_sine(self):
+        # 振幅 a の正弦波の実効値は a/√2
+        self.assertAlmostEqual(wake_listener.rms(_tone(1.0, 0.2)), 0.2 / np.sqrt(2), places=3)
 
 
 class WakeDetectorTest(unittest.TestCase):
@@ -133,6 +149,7 @@ class WakeDetectorTest(unittest.TestCase):
         return wake_listener.WakeDetector(
             transcribe=transcribe,
             on_wake=lambda: self.fired.append(True),
+            is_speech=_loud_is_speech,
         )
 
     def _feed(self, det, signal, block_sec=0.1):
@@ -299,6 +316,7 @@ class SafeLogTest(unittest.TestCase):
             transcribe=lambda audio: "やっほークロード🙂",
             on_wake=lambda: fired.append(True),
             log=wake_listener.safe_log,
+            is_speech=_loud_is_speech,
         )
         with unittest.mock.patch.object(sys, "stdout", out):
             det.start()
@@ -311,6 +329,124 @@ class SafeLogTest(unittest.TestCase):
                 time.sleep(0.02)
             det.stop()
         self.assertEqual(len(fired), 1, "ログの文字コードで検出ごと死んでいる")
+
+
+class PrerollTest(unittest.TestCase):
+    """VAD が「発話」と気づく前のフレームも、さかのぼって発話に含めること。
+
+    VAD の判定は語頭がある程度入ってから立ち上がるため、これが無いと語頭が欠け、
+    Whisper がその発話を拾い損ねる(実機で「たまに聞き取らない」として出た)。
+    """
+
+    def test_segment_starts_before_the_speech_onset(self):
+        captured = []
+        seg = wake_listener.SpeechSegmenter(
+            captured.append,
+            silence_hold_sec=0.7, min_speech_sec=0.5, max_segment_sec=60.0,
+            check_interval_sec=None, queue_size=8, is_speech=_loud_is_speech,
+        )
+        seg.start()
+        signal = np.concatenate([_silence(1.0), _tone(1.0, 0.2), _silence(1.5)])
+        step = int(0.1 * wake_listener.SAMPLE_RATE)
+        for i in range(0, len(signal), step):
+            seg.feed(signal[i:i + step])
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not captured:
+            time.sleep(0.02)
+        seg.stop()
+
+        self.assertTrue(captured, "発話区間が切り出されていない")
+        head = captured[0][:wake_listener.FRAME_SAMPLES]
+        self.assertLess(
+            wake_listener.rms(head), 0.001,
+            "発話の頭から始まっている = さかのぼり(preroll)が効いていない",
+        )
+
+
+class LastSpeechAtTest(unittest.TestCase):
+    """`last_speech_at` は口述セッションの無音タイムアウト判定に使う。
+
+    ここが更新されないと、喋り続けていてもセッションが勝手に終わる。
+    逆に無音でも更新されると、放置しても永遠に終わらない。
+    """
+
+    def _make(self):
+        return wake_listener.SpeechSegmenter(lambda audio: None, is_speech=_loud_is_speech)
+
+    def test_start_primes_the_timestamp(self):
+        # 一度も喋らないまま即タイムアウト扱いにならないこと
+        seg = self._make()
+        seg.start()
+        self.assertGreater(seg.last_speech_at, 0.0)
+        seg.stop()
+
+    def test_speech_updates_the_timestamp(self):
+        seg = self._make()
+        seg.start()
+        seg.last_speech_at = 0.0
+        seg.feed(_tone(0.5, 0.2))
+        self.assertGreater(seg.last_speech_at, 0.0, "喋っても発話時刻が更新されていない")
+        seg.stop()
+
+    def test_silence_does_not_update_the_timestamp(self):
+        seg = self._make()
+        seg.start()
+        seg.last_speech_at = 0.0
+        seg.feed(_silence(1.0))
+        self.assertEqual(seg.last_speech_at, 0.0, "無音で発話時刻が更新されている")
+        seg.stop()
+
+
+class SileroSpeechDetectorTest(unittest.TestCase):
+    """本番の発話判定(Silero VAD)そのものの検証。
+
+    音量では判定できないマイクがあるため VAD に置き換えた経緯があるので、
+    「無音を発話と言わない」ことだけは必ず守る(ここが崩れると連続口述の区切りが
+    永遠に来ず、喋っても何も貼られない)。
+    """
+
+    def setUp(self):
+        self.detector = wake_listener.SileroSpeechDetector()
+
+    def _frame(self, data):
+        return data[:wake_listener.FRAME_SAMPLES]
+
+    def test_digital_silence_is_not_speech(self):
+        for _ in range(5):
+            self.assertFalse(self.detector.is_speech(self._frame(_silence(1.0))))
+
+    def test_sine_tone_is_not_speech(self):
+        # 一定の正弦波は「音はあるが音声ではない」。音量判定だとここで誤爆する
+        self.assertFalse(self.detector.is_speech(self._frame(_tone(1.0, 0.3))))
+
+    def test_white_noise_is_not_speech(self):
+        rng = np.random.default_rng(0)
+        noise = rng.normal(0, 0.08, wake_listener.FRAME_SAMPLES).astype(np.float32)
+        # 暗騒音相当(実測の無音時 RMS 0.05 前後)を発話と言わないこと
+        self.assertGreater(wake_listener.rms(noise), 0.05)
+        self.assertFalse(self.detector.is_speech(noise))
+
+    def test_real_speech_is_detected(self):
+        """TTS で作った実音声は発話と判定されること。
+
+        test.wav は gen_test_wav.ps1 で生成する(Windows の音声合成)。無ければスキップ。
+        """
+        wav = pathlib.Path(__file__).resolve().parent.parent / "test.wav"
+        if not wav.exists():
+            self.skipTest("test.wav が無い(gen_test_wav.ps1 で生成できる)")
+        with wave.open(str(wav)) as w:
+            sr = w.getframerate()
+            raw = w.readframes(w.getnframes())
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        if sr != wake_listener.SAMPLE_RATE:
+            audio = audio[:: sr // wake_listener.SAMPLE_RATE]
+        step = wake_listener.FRAME_SAMPLES
+        hits = sum(
+            self.detector.is_speech(audio[i:i + step])
+            for i in range(0, len(audio) - step, step)
+        )
+        total = len(range(0, len(audio) - step, step))
+        self.assertGreater(hits / total, 0.5, "実音声の過半数を発話と判定できていない")
 
 
 class DictationSegmenterTest(unittest.TestCase):
@@ -326,6 +462,7 @@ class DictationSegmenterTest(unittest.TestCase):
             max_segment_sec=60.0,
             check_interval_sec=None,   # 途中で区切らない
             queue_size=8,
+            is_speech=_loud_is_speech,
         )
         opts.update(kw)
         return wake_listener.SpeechSegmenter(

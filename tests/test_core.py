@@ -192,5 +192,72 @@ class VoiceCommandRunTest(unittest.TestCase):
         self.assertEqual(len(enters), 2)
 
 
+class VocabPromptBudgetTest(unittest.TestCase):
+    """語彙ヒントが Whisper の prompt 枠(末尾 223 トークン)から溢れないこと。
+
+    溢れた分は Whisper 側で警告なく捨てられ、「vocab.txt に足したのに効かない」
+    が無言で起きる。ここでは実測に合わせトークン数=文字数の概算で検証する
+    (モデル未ロード時の経路と同じ)。
+    """
+
+    def _core(self, words, tmp):
+        path = os.path.join(tmp, "vocab.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(words))
+        with mock.patch.object(core.keyboard, "Controller"):
+            return VoiceCore(vocab_file=path)
+
+    def test_short_vocab_is_kept_whole(self):
+        import tempfile
+        words = ["山王病院", "つじラボ", "オリコン"]
+        with tempfile.TemporaryDirectory() as tmp:
+            vc = self._core(words, tmp)
+        for w in words:
+            self.assertIn(w, vc.initial_prompt)
+
+    def test_prompt_stays_within_token_limit(self):
+        import tempfile
+        words = [f"検証用語彙{i:03d}" for i in range(200)]
+        with tempfile.TemporaryDirectory() as tmp:
+            vc = self._core(words, tmp)
+        self.assertLessEqual(vc.count_tokens(vc.initial_prompt),
+                             core.PROMPT_TOKEN_LIMIT)
+
+    def test_punctuation_hint_survives_a_huge_vocab(self):
+        """語彙が溢れても句読点誘導文は残る(これが消えると句読点が付かなくなる)。"""
+        import tempfile
+        words = [f"検証用語彙{i:03d}" for i in range(200)]
+        with tempfile.TemporaryDirectory() as tmp:
+            vc = self._core(words, tmp)
+        self.assertIn("句読点を適切に付けて", vc.initial_prompt)
+
+    def test_last_words_win_when_vocab_overflows(self):
+        """溢れたときに残るのは末尾の語(Whisper が末尾から採るのに合わせる)。"""
+        import tempfile
+        words = [f"検証用語彙{i:03d}" for i in range(200)]
+        with tempfile.TemporaryDirectory() as tmp:
+            vc = self._core(words, tmp)
+        self.assertIn("検証用語彙199", vc.initial_prompt)
+        self.assertNotIn("検証用語彙000", vc.initial_prompt)
+
+    def test_overflow_is_reported(self):
+        """黙って捨てない: 落ちた語を必ず知らせる。"""
+        import tempfile
+        words = [f"検証用語彙{i:03d}" for i in range(200)]
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("builtins.print") as p:
+                self._core(words, tmp)
+        said = " ".join(str(c) for c in p.call_args_list)
+        self.assertIn("検証用語彙000", said)
+
+    def test_no_report_when_vocab_fits(self):
+        """収まっているのに警告を出さない(狼少年にしない)。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("builtins.print") as p:
+                self._core(["山王病院", "つじラボ"], tmp)
+        p.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
