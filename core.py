@@ -183,6 +183,15 @@ class VoiceCore:
         # 実トークン数で組み直す(概算は安全側=多めなので、ここで枠が広がる)。
         self.reload_vocab()
 
+    def warmup(self):
+        """ロード済みモデルに無音を1回通し、初回推論の初期化コスト(実測 0.5s)を
+        起動時に前払いする。ユーザーの最初の口述がその分だけ遅れないようにするため。"""
+        silence = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        if self.model is not None:
+            list(self.model.transcribe(silence, language=self.language, beam_size=1)[0])
+        if self.preview_model is not None:
+            list(self.preview_model.transcribe(silence, language=self.language, beam_size=1)[0])
+
     def _callback(self, indata, frame_count, time_info, status):
         if self.recording:
             self._frames.append(indata.copy())

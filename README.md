@@ -34,6 +34,19 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1
 
 起動すると画面にマイクボタンが浮かぶ。**灰=ロード中 → 青=待機**になれば準備OK。
 
+**灰のうちから録音を始めてかまいません。** マイクにモデルは要らないので、喋っている間に
+ロードが裏で進み、停止時にまだ届いていなければそこで残りだけ待ちます(プレビュー欄に
+「モデル読込中」と出ます)。起動してすぐ喋り始めるのが一番速い使い方です。
+
+毎回の起動待ちをなくしたい場合は、Windows サインイン時に自動起動させます(任意)。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1 -Startup
+```
+
+スタートアップフォルダにもショートカットが入り、常駐したボタンをそのまま使えます。
+やめるときは `shell:startup` を開いて「VoiceTyping」を削除してください。
+
 ## 使い方
 
 1. 入力したいアプリにカーソルを置く

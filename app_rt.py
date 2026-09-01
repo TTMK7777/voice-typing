@@ -3,6 +3,8 @@
 
 - 録音中、small モデルで PREVIEW_INTERVAL 秒ごとに暫定テキストを更新表示(揺れる)
 - 停止で large-v3 が高精度確定 → アクティブウィンドウに自動入力
+- 起動直後(灰=モデルロード中)でも録音は始められる。マイクにモデルは要らないので、
+  ロードは録音の裏で進み、停止時にまだ無ければそこで待つ(待つのは差分だけ)
 - ボタン/プレビューともフォーカスを奪わない(入力先がズレない)
 """
 import sys
@@ -168,6 +170,9 @@ class MicButton(QWidget):
         self._preview_running = False
         # ウェイクワード待受: small モデルを暫定プレビューと共用するため排他する
         self._model_lock = threading.Lock()
+        # 確定モデル(large-v3)が使えるようになった / 全モデル+VAD が揃った
+        self._final_ready = threading.Event()
+        self._models_ready = threading.Event()
         self.wake_on = False
         self._wake = WakeDetector(
             transcribe=self._wake_transcribe,
@@ -195,6 +200,7 @@ class MicButton(QWidget):
             "Ctrl+Alt+L = ウェイクワード待受(「やっほークロード」)の ON/OFF\n"
             "緑 = 待受中 / 赤 = 連続口述中(喋ると貼られます)\n"
             "録音中は Enter でも停止できます\n"
+            "灰(ロード中)でも録音は始められます\n"
             "右クリック = メニュー"
         )
         self.resize(BTN_SIZE, BTN_SIZE)
@@ -224,13 +230,21 @@ class MicButton(QWidget):
         QApplication.instance().aboutToQuit.connect(self._stop_listening)
 
     def _load_models(self):
-        # 暫定用(small)→ 確定用(large-v3)の順でロード
-        self.core.load_preview_model(PREVIEW_MODEL)
+        # 確定用(large-v3)を先にロードする。録音はモデル無しで始められるので、
+        # ユーザーが最初に待たされるのは「停止 → 確定」であり、そこに要るのはこちら。
+        # 暫定プレビュー(small)は無くても録音は進むので後回しでよい。
         self.core.load_model()
+        self.core.warmup()
+        self._final_ready.set()
+        self.core.load_preview_model(PREVIEW_MODEL)
+        self.core.warmup()
         # VAD も先に読み込む(音声が流れ始めてから引くとコールバックが詰まる)
         self._wake.preload()
         self._dictate.preload()
-        self.state_changed.emit(IDLE)
+        self._models_ready.set()
+        # 状態遷移はメインスレッドで判断する(ロード中に録音が始まっていれば
+        # 今は RECORDING/BUSY なので、ここで IDLE に上書きしてはいけない)
+        self.notify.emit("__models_ready__")
 
     # ---- ウェイクワード待受 ----
     def set_wake_mode(self, on):
@@ -319,11 +333,11 @@ class MicButton(QWidget):
 
     # ---- 録音トグル ----
     def toggle(self):
-        if self.state == LOADING:
-            return
         if self.state == SESSION:
             self._end_session()
-        elif self.state == IDLE:
+        elif self.state in (IDLE, LOADING):
+            # LOADING でも録音は始める。マイクにモデルは不要で、確定に要る
+            # large-v3 は _finish で待つ(録音している間にロードが進む)
             self._stop_listening()   # 録音と待受で同じマイクを取り合わないよう先に閉じる
             self.core.start_recording()
             self.state_changed.emit(RECORDING)
@@ -340,7 +354,8 @@ class MicButton(QWidget):
         self.preview.show()
 
     def _start_preview(self):
-        self._show_preview("")
+        self._show_preview("" if self.core.preview_model is not None
+                           else "(モデル読込中… 録音は続いています)")
         self._preview_running = True
         threading.Thread(target=self._preview_loop, daemon=True).start()
 
@@ -348,6 +363,8 @@ class MicButton(QWidget):
         while self._preview_running:
             t0 = time.time()
             audio = self.core.snapshot_audio()
+            if self.core.preview_model is None:
+                audio = None   # 暫定モデルがまだ無い間は待つだけ(録音は進んでいる)
             if audio is not None and len(audio) > SAMPLE_RATE * 0.3:
                 try:
                     with self._model_lock:
@@ -364,6 +381,10 @@ class MicButton(QWidget):
             audio = self.core.stop_recording()
             if audio is None or len(audio) == 0:
                 return
+            if not self._final_ready.is_set():
+                # 起動直後に喋り始めたケース。ここで待つのは残りのロード時間だけ
+                self.preview_text.emit("(モデル読込中… そのまま待ってください)")
+                self._final_ready.wait()
             t_stop = time.time()
             text = self.core.transcribe(audio)
             t_text = time.time()
@@ -375,7 +396,9 @@ class MicButton(QWidget):
                   f"確定 {t_text - t_stop:.2f}s / 貼付 {time.time() - t_text:.2f}s")
         finally:
             self.preview_text.emit("__hide__")
-            self.state_changed.emit(IDLE)  # 待受 ON なら _on_state がマイク監視を再開する
+            # 全モデルが揃う前に録音していたなら灰に戻す(揃えば IDLE)。
+            # 待受 ON なら _on_state がマイク監視を再開する
+            self.state_changed.emit(IDLE if self._models_ready.is_set() else LOADING)
 
     # ---- 録音中の Enter キーで停止(低レベルフック、メインスレッドで呼ばれる) ----
     def _on_low_level_key(self, nCode, wParam, lParam):
@@ -411,6 +434,8 @@ class MicButton(QWidget):
 
     # ---- シグナルハンドラ(メインスレッド) ----
     def _on_state(self, state):
+        if state == LOADING and self._models_ready.is_set():
+            state = IDLE   # ロード完了と _finish の「灰へ戻す」が競合したときの保険
         self.state = state
         if state == IDLE and self.wake_on:
             self._start_listening()
@@ -436,6 +461,9 @@ class MicButton(QWidget):
         elif msg == "__end_session__":
             if self.state == SESSION:
                 self._end_session()
+        elif msg == "__models_ready__":
+            if self.state == LOADING:
+                self._on_state(IDLE)   # 録音中なら _finish 側が IDLE に戻す
 
     # ---- 描画 ----
     def paintEvent(self, event):
