@@ -183,13 +183,14 @@ class VoiceCore:
         # 実トークン数で組み直す(概算は安全側=多めなので、ここで枠が広がる)。
         self.reload_vocab()
 
-    def warmup(self):
+    def warmup(self, final=True, preview=True):
         """ロード済みモデルに無音を1回通し、初回推論の初期化コスト(実測 0.5s)を
-        起動時に前払いする。ユーザーの最初の口述がその分だけ遅れないようにするため。"""
+        起動時に前払いする。ユーザーの最初の口述がその分だけ遅れないようにするため。
+        2 段に分けてロードするときは、今読んだ方だけを温める(片方を 2 回温めない)。"""
         silence = np.zeros(SAMPLE_RATE, dtype=np.float32)
-        if self.model is not None:
+        if final and self.model is not None:
             list(self.model.transcribe(silence, language=self.language, beam_size=1)[0])
-        if self.preview_model is not None:
+        if preview and self.preview_model is not None:
             list(self.preview_model.transcribe(silence, language=self.language, beam_size=1)[0])
 
     def _callback(self, indata, frame_count, time_info, status):
@@ -359,12 +360,15 @@ class VoiceCore:
             return None
         return np.concatenate(self._frames, axis=0).flatten()
 
-    def transcribe_preview(self, audio):
-        """暫定表示用の高速変換(精度より速度優先)。"""
-        # プレビューは速報優先。プロンプトを入れると幻覚/空を招くため付けない
+    def transcribe_preview(self, audio, initial_prompt=None):
+        """暫定表示用の高速変換(精度より速度優先)。
+
+        initial_prompt は既定で付けない: 暫定プレビューにプロンプトを入れると幻覚/空を
+        招くため。ウェイクワード判定のように「来てほしい語が1つに決まっている」用途だけ渡す。
+        """
         segments, _ = self.preview_model.transcribe(
             audio, language=self.language, beam_size=1,
-            condition_on_previous_text=False,
+            condition_on_previous_text=False, initial_prompt=initial_prompt,
         )
         return self._strip_hallucinations(
             "".join(seg.text for seg in segments).strip()
