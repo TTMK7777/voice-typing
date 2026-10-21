@@ -7,6 +7,8 @@
   ロードは録音の裏で進み、停止時にまだ無ければそこで待つ(待つのは差分だけ)
 - ボタン/プレビューともフォーカスを奪わない(入力先がズレない)
 """
+import json
+import os
 import sys
 import time
 import threading
@@ -20,6 +22,7 @@ from pynput import keyboard as pynput_keyboard
 
 from core import VoiceCore, SAMPLE_RATE
 from wake_listener import WakeDetector, SpeechSegmenter, safe_log
+from wake_word import WAKE_PROMPT
 
 IDLE, LOADING, RECORDING, BUSY = "idle", "loading", "recording", "busy"
 SESSION = "session"                    # 連続口述セッション中(喋る→黙る→貼る の繰り返し)
@@ -81,6 +84,35 @@ MIN_UTTERANCE_SEC = 0.5        # これより短い音は貼らない(相槌・�
 MAX_UTTERANCE_SEC = 60.0       # 1発話の上限(区切らず喋り続けた場合の保険)
 SESSION_IDLE_TIMEOUT_SEC = 30.0  # 何も喋らないままこの時間たったらセッションを終える
 UTTERANCE_QUEUE = 8            # 文字起こし待ちの発話をためておける数
+# 長く喋り続けるときは息継ぎで区切り、喋っている間にも前半を貼っていく。
+# 区切らないと、黙るまで何も貼られない(25 秒喋ると 25 秒間なにも出ない)。
+# 実測(2026-10-21, TTS 17 秒の発話): 最初の貼り付けが 12.2 秒 → 8.3 秒時点に早まり、
+# 最後の貼り付けは喋り終わりの 0.05〜0.6 秒後。区切っても句読点・変換は崩れなかった。
+DICTATE_LONG_SPEECH_SEC = 4.0  # 発話がこれを超えたら…
+DICTATE_BREATH_SEC = 0.25      # …この長さの息継ぎでも区切る(短すぎると語の途中で切れる)
+SESSION_PREVIEW_MAX_SEC = 10.0  # 喋っている途中のプレビューに回す末尾の長さ(重くしない)
+
+# 端末ごとの設定(待受 ON/OFF を次回起動に持ち越す)。.gitignore 済み
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".vt_config.json")
+
+
+def load_config():
+    """設定を読む。無い・壊れているときは空(既定値)で起動する。"""
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(data):
+    """設定を書く。書けなくても機能は止めない(次回の既定値が変わるだけ)。"""
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except OSError as e:
+        safe_log(f"[config] 設定を保存できませんでした: {e}")
 
 
 def apply_noactivate(widget):
@@ -170,27 +202,21 @@ class MicButton(QWidget):
         self._preview_running = False
         # ウェイクワード待受: small モデルを暫定プレビューと共用するため排他する
         self._model_lock = threading.Lock()
-        # 確定モデル(large-v3)が使えるようになった / 全モデル+VAD が揃った
+        # 確定モデル(large-v3)が使えるようになった / ボタンを灰から戻してよい
+        # (待受を使うなら small+VAD、使わないなら全モデルが揃った時点。_load_models 参照)
         self._final_ready = threading.Event()
         self._models_ready = threading.Event()
+        self._finalizing = threading.Event()   # 発話を確定中(途中プレビューは GPU を譲る)
         self.wake_on = False
+        # 前回 ON で終えていれば、起動後に自動で待受を再開する(毎回メニューから入れ直さない)
+        self._wake_wanted = bool(load_config().get("wake_on"))
         self._wake = WakeDetector(
             transcribe=self._wake_transcribe,
             on_wake=lambda: self.notify.emit("__wake__"),
             sample_rate=SAMPLE_RATE,
             log=safe_log,
         )
-        # 連続口述: 喋り終わりの無音で区切り、区間ごとに確定 → 貼り付け
-        self._dictate = SpeechSegmenter(
-            self._on_utterance,
-            sample_rate=SAMPLE_RATE,
-            silence_hold_sec=DICTATE_SILENCE_SEC,
-            min_speech_sec=MIN_UTTERANCE_SEC,
-            max_segment_sec=MAX_UTTERANCE_SEC,
-            check_interval_sec=None,   # 途中で区切らない(黙るまでが1発話)
-            queue_size=UTTERANCE_QUEUE,
-            log=safe_log,
-        )
+        self._dictate = self._make_dictation_segmenter()
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -229,27 +255,61 @@ class MicButton(QWidget):
         QApplication.instance().aboutToQuit.connect(self._uninstall_enter_hook)
         QApplication.instance().aboutToQuit.connect(self._stop_listening)
 
+    def _make_dictation_segmenter(self):
+        """連続口述: 喋り終わりの無音で区切り、区間ごとに確定 → 貼り付け。
+        長く喋り続けるときは息継ぎでも区切る(喋っている間にも貼られていく)。"""
+        return SpeechSegmenter(
+            self._on_utterance,
+            sample_rate=SAMPLE_RATE,
+            silence_hold_sec=DICTATE_SILENCE_SEC,
+            min_speech_sec=MIN_UTTERANCE_SEC,
+            max_segment_sec=MAX_UTTERANCE_SEC,
+            check_interval_sec=None,   # 喋っている最中には区切らない(区切るのは無音/息継ぎ)
+            long_speech_sec=DICTATE_LONG_SPEECH_SEC,
+            short_silence_sec=DICTATE_BREATH_SEC,
+            queue_size=UTTERANCE_QUEUE,
+            log=safe_log,
+        )
+
     def _load_models(self):
-        # 確定用(large-v3)を先にロードする。録音はモデル無しで始められるので、
-        # ユーザーが最初に待たされるのは「停止 → 確定」であり、そこに要るのはこちら。
-        # 暫定プレビュー(small)は無くても録音は進むので後回しでよい。
+        # 状態遷移はメインスレッドで判断する(ロード中に録音が始まっていれば
+        # 今は RECORDING/BUSY なので、ここで IDLE に上書きしてはいけない)ので、
+        # ここからは __models_ready__ を通知するだけにする。
+        if self._wake_wanted:
+            # 待受から使う人は small + VAD が揃えば使い始められる(ロード 1 秒強)。
+            # large-v3(3 秒強)は、ウェイクワードを言って最初の発話を終えるまでに
+            # 裏で揃えばよい。間に合わなければ _on_utterance が待つ
+            self._load_listening_models()
+            self._models_ready.set()
+            self.notify.emit("__models_ready__")
+            self._load_final_model()
+        else:
+            # 確定用(large-v3)が先。録音はモデル無しで始められるので、
+            # ユーザーが最初に待たされるのは「停止 → 確定」であり、そこに要るのはこちら
+            self._load_final_model()
+            self._load_listening_models()
+            self._models_ready.set()
+            self.notify.emit("__models_ready__")
+
+    def _load_final_model(self):
         self.core.load_model()
-        self.core.warmup()
+        self.core.warmup(preview=False)
         self._final_ready.set()
+
+    def _load_listening_models(self):
         self.core.load_preview_model(PREVIEW_MODEL)
-        self.core.warmup()
+        self.core.warmup(final=False)
         # VAD も先に読み込む(音声が流れ始めてから引くとコールバックが詰まる)
         self._wake.preload()
         self._dictate.preload()
-        self._models_ready.set()
-        # 状態遷移はメインスレッドで判断する(ロード中に録音が始まっていれば
-        # 今は RECORDING/BUSY なので、ここで IDLE に上書きしてはいけない)
-        self.notify.emit("__models_ready__")
 
     # ---- ウェイクワード待受 ----
     def set_wake_mode(self, on):
+        self._wake_wanted = bool(on)
+        save_config({"wake_on": self._wake_wanted})
         if on and self.state == LOADING:
-            safe_log("[wake] モデルのロード中は待受を開始できません")
+            # 断らずに覚えておき、ロードが終わったら始める(__models_ready__)
+            safe_log("[wake] ロードが終わったら待受を開始します")
             return
         self.wake_on = bool(on)
         if self.wake_on:
@@ -280,7 +340,7 @@ class MicButton(QWidget):
 
     def _wake_transcribe(self, audio):
         with self._model_lock:
-            return self.core.transcribe_preview(audio)
+            return self.core.transcribe_preview(audio, initial_prompt=WAKE_PROMPT)
 
     # ---- 連続口述セッション ----
     def _start_session(self):
@@ -295,6 +355,7 @@ class MicButton(QWidget):
         self._show_preview("聞いています…")
         self.state_changed.emit(SESSION)
         threading.Thread(target=self._session_watchdog, daemon=True).start()
+        threading.Thread(target=self._session_preview_loop, daemon=True).start()
         safe_log("[session] 開始: 喋る → 黙る → 貼り付け。止めるにはボタン/Ctrl+Alt+Space")
 
     def _end_session(self):
@@ -307,9 +368,24 @@ class MicButton(QWidget):
 
     def _on_utterance(self, audio):
         """1発話ぶんの音声を確定して貼り付ける(SpeechSegmenter のスレッドで直列実行)。"""
+        if not self._final_ready.is_set():
+            # 待受を先に使えるようにしたぶん、最初の発話で large-v3 が未着のことがある
+            generation = self._dictate.generation
+            self.preview_text.emit("(モデル読込中… そのまま待ってください)")
+            self._final_ready.wait()
+            if self._dictate.generation != generation:
+                # 待っている間にセッションが終わった。揃った時点のフォーカス先は
+                # もう口述していた窓とは限らないので、貼らずに捨てる
+                safe_log("[session] モデル読込待ちの間にセッションが終わったため、1 件を貼りませんでした")
+                return
         t_start = time.time()
-        with self._model_lock:
+        # large-v3 は small と別モデルなので _model_lock(small の共用排他)は取らない。
+        # 代わりに「確定中」を立て、途中プレビューに GPU を譲らせる
+        self._finalizing.set()
+        try:
             text = self.core.transcribe(audio)
+        finally:
+            self._finalizing.clear()
         t_text = time.time()
         if text:
             self.preview_text.emit(text)
@@ -321,6 +397,28 @@ class MicButton(QWidget):
         safe_log(f"[timing] 音声 {len(audio) / SAMPLE_RATE:.1f}s / "
                  f"確定 {t_text - t_start:.2f}s / 貼付 {time.time() - t_text:.2f}s / "
                  f"体感 {DICTATE_SILENCE_SEC + time.time() - t_start:.2f}s")
+
+    def _session_preview_loop(self):
+        """連続口述中、喋っている途中の文字を small で出し続ける。
+
+        貼り付けは区切り(無音/息継ぎ)ごとに large-v3 で確定してから行う。
+        ここは「拾えているか」を喋りながら見せるための速報で、貼り付けには使わない。
+        """
+        while self.state == SESSION:
+            t0 = time.time()
+            audio = self._dictate.current_audio()
+            if (audio is not None and len(audio) > SAMPLE_RATE * 0.3
+                    and self.core.preview_model is not None
+                    and not self._finalizing.is_set()):
+                audio = audio[-int(SAMPLE_RATE * SESSION_PREVIEW_MAX_SEC):]
+                try:
+                    with self._model_lock:
+                        text = self.core.transcribe_preview(audio)
+                    if text and self.state == SESSION:
+                        self.preview_text.emit(text)
+                except Exception:
+                    pass
+            time.sleep(max(0.05, PREVIEW_INTERVAL - (time.time() - t0)))
 
     def _session_watchdog(self):
         """しばらく何も喋らなければセッションを終える(言いっぱなしの放置対策)。"""
@@ -451,7 +549,9 @@ class MicButton(QWidget):
         if msg == "__toggle__":
             self.toggle()
         elif msg == "__wake_toggle__":
-            self.set_wake_mode(not self.wake_on)
+            # ロード中は待受がまだ開いていないので、「予約」の有無で切り替える
+            current = self._wake_wanted if self.state == LOADING else self.wake_on
+            self.set_wake_mode(not current)
         elif msg == "__wake__":
             # ウェイクワード検出。この時点で待受は自分で止まっている。
             if self.state == IDLE:
@@ -464,6 +564,8 @@ class MicButton(QWidget):
         elif msg == "__models_ready__":
             if self.state == LOADING:
                 self._on_state(IDLE)   # 録音中なら _finish 側が IDLE に戻す
+            if self._wake_wanted and not self.wake_on:
+                self.set_wake_mode(True)   # 前回 ON / ロード中に ON にされた待受を始める
 
     # ---- 描画 ----
     def paintEvent(self, event):

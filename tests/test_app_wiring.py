@@ -103,7 +103,16 @@ class SessionTest(unittest.TestCase):
         fake = _fake(wake_on=True)
         with mock.patch.object(app_rt.threading, "Thread") as thread:
             MicButton._start_session(fake)
-        self.assertIs(thread.call_args.kwargs["target"], fake._session_watchdog)
+        targets = [c.kwargs["target"] for c in thread.call_args_list]
+        self.assertIn(fake._session_watchdog, targets)
+
+    def test_starting_a_session_launches_the_live_preview(self):
+        # 喋っている途中から文字が見える(黙るまで「聞いています…」のままにしない)
+        fake = _fake(wake_on=True)
+        with mock.patch.object(app_rt.threading, "Thread") as thread:
+            MicButton._start_session(fake)
+        targets = [c.kwargs["target"] for c in thread.call_args_list]
+        self.assertIn(fake._session_preview_loop, targets)
 
     def test_ending_a_session_returns_to_listening_when_wake_is_on(self):
         fake = _fake(wake_on=True)
@@ -147,6 +156,76 @@ class SessionTest(unittest.TestCase):
         fake.notify.emit.assert_not_called()
 
 
+class WakeTranscribeTest(unittest.TestCase):
+    def test_wake_check_passes_the_wake_word_as_a_hint(self):
+        # ヒント無しの small は「ヤフオクロード」等に化け、合成音声で 18 件中 10 件
+        # (雑音下 5 件)しか拾えなかった。ヒント付きで 17 件、誤検出は 38 件中 0 件(2026-10-21)
+        fake = _fake()
+        fake._model_lock = threading.Lock()
+        MicButton._wake_transcribe(fake, np.zeros(16000, dtype=np.float32))
+        kwargs = fake.core.transcribe_preview.call_args.kwargs
+        self.assertEqual(kwargs.get("initial_prompt"), app_rt.WAKE_PROMPT)
+
+
+class SessionPreviewTest(unittest.TestCase):
+    """連続口述中の途中経過表示。"""
+
+    def _fake(self, audio, finalizing=False, ticks=1):
+        fake = _fake(state=app_rt.SESSION)
+        fake._model_lock = threading.Lock()
+        fake._finalizing = threading.Event()
+        if finalizing:
+            fake._finalizing.set()
+        fake._dictate.current_audio.return_value = audio
+        fake.core.transcribe_preview.return_value = "途中まで"
+        count = []
+
+        def sleep(_):
+            count.append(1)
+            if len(count) >= ticks:
+                fake.state = app_rt.IDLE
+        self.sleep = sleep
+        return fake
+
+    def _run(self, fake):
+        with mock.patch.object(app_rt.time, "sleep", side_effect=self.sleep):
+            MicButton._session_preview_loop(fake)
+
+    def test_shows_the_utterance_in_progress(self):
+        fake = self._fake(np.zeros(16000, dtype=np.float32))
+        self._run(fake)
+        fake.preview_text.emit.assert_called_once_with("途中まで")
+
+    def test_yields_the_gpu_while_an_utterance_is_being_finalized(self):
+        # 確定(large-v3)の最中に small を回すと、肝心の貼り付けが遅れる
+        fake = self._fake(np.zeros(16000, dtype=np.float32), finalizing=True)
+        self._run(fake)
+        fake.core.transcribe_preview.assert_not_called()
+
+    def test_does_nothing_between_utterances(self):
+        fake = self._fake(None)
+        self._run(fake)
+        fake.core.transcribe_preview.assert_not_called()
+        fake.preview_text.emit.assert_not_called()
+
+    def test_long_utterance_preview_is_bounded(self):
+        # 1 分喋り続けても、プレビューに回すのは末尾だけ(重くならない)
+        fake = self._fake(np.zeros(16000 * 60, dtype=np.float32))
+        self._run(fake)
+        audio = fake.core.transcribe_preview.call_args.args[0]
+        self.assertLessEqual(len(audio), 16000 * app_rt.SESSION_PREVIEW_MAX_SEC)
+
+    def test_dictation_segmenter_splits_long_speech_at_breaths(self):
+        # 区切り設定が実際に渡っていること(定数を置いただけで配線漏れ、を防ぐ)
+        with mock.patch.object(app_rt, "SpeechSegmenter") as seg, \
+                mock.patch.object(app_rt, "WakeDetector"):
+            fake = _fake()
+            MicButton._make_dictation_segmenter(fake)
+        kw = seg.call_args.kwargs
+        self.assertEqual(kw["long_speech_sec"], app_rt.DICTATE_LONG_SPEECH_SEC)
+        self.assertEqual(kw["short_silence_sec"], app_rt.DICTATE_BREATH_SEC)
+
+
 class UtteranceTest(unittest.TestCase):
     def test_transcribes_then_delivers(self):
         calls = []
@@ -164,6 +243,115 @@ class UtteranceTest(unittest.TestCase):
         fake.core.transcribe.return_value = ""
         MicButton._on_utterance(fake, np.zeros(16000, dtype=np.float32))
         fake.core.deliver.assert_not_called()
+
+    def test_waits_for_the_final_model(self):
+        # 待受から使う場合は small を先に読むので、最初の発話の時点で large-v3 が
+        # まだ無いことがある。そのときは捨てずに待つ
+        fake = _fake()
+        fake._final_ready = threading.Event()
+        fake._finalizing = threading.Event()
+        order = []
+        fake.core.transcribe.side_effect = lambda a: (order.append("transcribe"), "テスト")[1]
+
+        def loader():
+            time.sleep(0.2)
+            order.append("ready")
+            fake._final_ready.set()
+
+        threading.Thread(target=loader).start()
+        MicButton._on_utterance(fake, np.zeros(16000, dtype=np.float32))
+        self.assertEqual(order, ["ready", "transcribe"])
+
+    def test_utterance_from_an_ended_session_is_not_pasted(self):
+        # large-v3 を待っている間にセッションを終えたら、揃った時点の(別の)窓へ貼らない
+        fake = _fake()
+        fake._final_ready = threading.Event()
+        fake._finalizing = threading.Event()
+        fake._dictate.generation = 1
+        fake.core.transcribe.return_value = "テスト"
+
+        def end_session_then_load():
+            time.sleep(0.1)
+            fake._dictate.generation = 2   # 終了(→再開)で世代が変わる
+            fake._final_ready.set()
+
+        threading.Thread(target=end_session_then_load).start()
+        MicButton._on_utterance(fake, np.zeros(16000, dtype=np.float32))
+        fake.core.deliver.assert_not_called()
+
+    def test_marks_itself_as_finalizing_while_transcribing(self):
+        fake = _fake()
+        fake._finalizing = threading.Event()
+        seen = []
+        fake.core.transcribe.side_effect = lambda a: (seen.append(fake._finalizing.is_set()), "x")[1]
+        MicButton._on_utterance(fake, np.zeros(16000, dtype=np.float32))
+        self.assertEqual(seen, [True])
+        self.assertFalse(fake._finalizing.is_set(), "確定後も確定中のまま(プレビューが止まる)")
+
+
+class WakePersistenceTest(unittest.TestCase):
+    """待受の ON/OFF を覚えて、次回起動時に自動で再開する。"""
+
+    def test_turning_wake_on_during_loading_is_remembered_not_refused(self):
+        fake = _fake(state=app_rt.LOADING, wake_on=False)
+        with mock.patch.object(app_rt, "save_config") as save:
+            MicButton.set_wake_mode(fake, True)
+        self.assertTrue(fake._wake_wanted)
+        fake._start_listening.assert_not_called()   # マイクはロード完了後に開く
+        save.assert_called_once_with({"wake_on": True})
+
+    def test_user_choice_is_saved(self):
+        fake = _fake(state=app_rt.IDLE, wake_on=True)
+        with mock.patch.object(app_rt, "save_config") as save:
+            MicButton.set_wake_mode(fake, False)
+        save.assert_called_once_with({"wake_on": False})
+
+    def test_hotkey_during_loading_can_cancel_the_reservation(self):
+        # ロード中は wake_on が False のままなので、それを見て切り替えると
+        # 何度押しても「ON にする」になり取り消せない
+        fake = _fake(state=app_rt.LOADING, wake_on=False, _wake_wanted=True)
+        MicButton._on_notify(fake, "__wake_toggle__")
+        fake.set_wake_mode.assert_called_once_with(False)
+
+    def test_models_ready_turns_on_wake_if_wanted(self):
+        fake = _fake(state=app_rt.LOADING, wake_on=False, _wake_wanted=True)
+        fake._on_state.side_effect = lambda s: setattr(fake, "state", s)
+        MicButton._on_notify(fake, "__models_ready__")
+        fake.set_wake_mode.assert_called_once_with(True)
+
+    def test_models_ready_leaves_wake_off_if_not_wanted(self):
+        fake = _fake(state=app_rt.LOADING, wake_on=False, _wake_wanted=False)
+        MicButton._on_notify(fake, "__models_ready__")
+        fake.set_wake_mode.assert_not_called()
+
+    def test_listening_models_load_first_when_wake_is_wanted(self):
+        # 待受から使う人は small + VAD が揃えば使い始められる(緑になるまでが速い)。
+        # large-v3 は最初の発話までに裏で揃えばよい
+        fake = _fake(_wake_wanted=True)
+        fake._final_ready = threading.Event()
+        fake._models_ready = threading.Event()
+        order = []
+        fake.core.load_model.side_effect = lambda: order.append(
+            "large" + ("(ready)" if fake._models_ready.is_set() else ""))
+        fake.core.load_preview_model.side_effect = lambda *_: order.append("small")
+        fake._load_final_model = lambda: MicButton._load_final_model(fake)
+        fake._load_listening_models = lambda: MicButton._load_listening_models(fake)
+        fake.notify.emit.side_effect = lambda m: order.append(m)
+        MicButton._load_models(fake)
+        self.assertEqual(order, ["small", "__models_ready__", "large(ready)"])
+        self.assertTrue(fake._final_ready.is_set())
+
+    def test_config_roundtrip(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, ".vt_config.json")
+            with mock.patch.object(app_rt, "CONFIG_PATH", path):
+                self.assertEqual(app_rt.load_config(), {})          # 無ければ空
+                app_rt.save_config({"wake_on": True})
+                self.assertEqual(app_rt.load_config(), {"wake_on": True})
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("{壊れた")
+                self.assertEqual(app_rt.load_config(), {})          # 壊れていても起動は止めない
 
 
 class ListeningLifecycleTest(unittest.TestCase):
@@ -283,13 +471,16 @@ class RecordWhileLoadingTest(unittest.TestCase):
 
     def test_final_model_loads_before_the_preview_model(self):
         # 確定に要る large-v3 を先に。ready フラグは large-v3 直後に立つ
-        fake = _fake()
+        # (待受を使わない人の順番。使う人は WakePersistenceTest を参照)
+        fake = _fake(_wake_wanted=False)
         fake._final_ready = threading.Event()
         fake._models_ready = threading.Event()
         order = []
         fake.core.load_model.side_effect = lambda: order.append("large")
         fake.core.load_preview_model.side_effect = lambda *_: order.append(
             "small" + ("(final ready)" if fake._final_ready.is_set() else ""))
+        fake._load_final_model = lambda: MicButton._load_final_model(fake)
+        fake._load_listening_models = lambda: MicButton._load_listening_models(fake)
         MicButton._load_models(fake)
         self.assertEqual(order, ["large", "small(final ready)"])
         self.assertTrue(fake._models_ready.is_set())

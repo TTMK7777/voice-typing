@@ -192,6 +192,35 @@ class VoiceCommandRunTest(unittest.TestCase):
         self.assertEqual(len(enters), 2)
 
 
+class PreviewTranscribeTest(unittest.TestCase):
+    def _core(self):
+        vc = VoiceCore()
+        vc.preview_model = mock.MagicMock()
+        vc.preview_model.transcribe.return_value = ([], None)
+        return vc
+
+    def test_hint_is_forwarded(self):
+        vc = self._core()
+        vc.transcribe_preview([0.0], initial_prompt="やっほー、クロード。")
+        self.assertEqual(vc.preview_model.transcribe.call_args.kwargs["initial_prompt"],
+                         "やっほー、クロード。")
+
+    def test_warmup_can_target_one_model(self):
+        # 2 段ロードで両方を毎回温めると、片方を 2 回温めて起動が遅れる(レビュー指摘 N6)
+        vc = self._core()
+        vc.model = mock.MagicMock()
+        vc.model.transcribe.return_value = ([], None)
+        vc.warmup(preview=False)
+        vc.model.transcribe.assert_called_once()
+        vc.preview_model.transcribe.assert_not_called()
+
+    def test_no_hint_by_default(self):
+        # 暫定プレビューには付けない(幻覚・空出力が増えるため)
+        vc = self._core()
+        vc.transcribe_preview([0.0])
+        self.assertIsNone(vc.preview_model.transcribe.call_args.kwargs.get("initial_prompt"))
+
+
 class VocabPromptBudgetTest(unittest.TestCase):
     """語彙ヒントが Whisper の prompt 枠(末尾 223 トークン)から溢れないこと。
 

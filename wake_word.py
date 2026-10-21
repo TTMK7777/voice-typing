@@ -31,6 +31,15 @@ _DROPPED = set("っー〜~・､、。,.!！?？:：;；「」『』()（） 　
 _WAKE_RE = re.compile(
     r"^.{0,3}(や[はほ](?!り)|yaho+)う?.{0,4}(くろ|ぐろ|くら[うど]|claude|cloud)"
 )
+# 前半「やっほー」だけで終わっている発話(ゆっくり言って区間が割れたときの 1 つ目)
+_WAKE_HEAD_RE = re.compile(r"^.{0,3}(や[はほ](?!り)|yaho+)う?$")
+
+# 待受の文字起こしに渡す認識ヒント(initial_prompt)。
+# ヒント無しの small は「ヤフオクロード」「やっとフォークロード」等に化けて表記揺れの
+# 吸収では追いつかない。実測(2026-10-21, TTS 18 件 / 負例 38 件): ヒント無しは
+# 検出 10 件(雑音下 5 件)、ヒント付きは 17 件(雑音下も 17 件)。誤検出はどちらも 0 件
+# (「ヤッホー!」「クロード」「おはよう、クロード」「やはりクロードは」を含む)。
+WAKE_PROMPT = "やっほー、クロード。"
 
 
 def normalize(text):
@@ -44,6 +53,14 @@ def normalize(text):
             continue
         chars.append(ch)
     return "".join(chars)
+
+
+def is_wake_head(text):
+    """「やっほー」だけで終わっていれば True(後ろに「クロード」が来るのを待つ価値がある)。
+
+    例: 「やっほー。」→ True / 「やっほー、元気?」→ False
+    """
+    return bool(_WAKE_HEAD_RE.match(normalize(text)))
 
 
 def is_wake(text):

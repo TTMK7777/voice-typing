@@ -61,6 +61,10 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1 -Startup
 ボタンもキーも触らずに口述を始めたいとき用。**既定は OFF**。
 
 - **ON/OFF**: `Ctrl+Alt+L`、または**右クリック → ウェイクワード待受**
+- **ON/OFF は覚えておきます。** ON のまま終了すると、次回は起動するだけで待受が始まります
+  (保存先は `.vt_config.json`。灰=ロード中に `Ctrl+Alt+L` を押した場合も、ロード後に始まります)
+- 待受 ON で起動したときは、待受に要る軽いモデルを先に読むので、**緑になるまで約 2.4 秒**
+  (確定用の large-v3 はその裏で読み込み、最初の発話までに間に合わなければそこで待ちます)
 - ボタンの色が状態を表す: **緑 = 待受中** / **赤 = 連続口述中(喋ると貼られる)**
 
 **ウェイクワードを言うのは最初の一度だけ**です。あとは「喋る → ちょっと黙る → 貼られる」を
@@ -74,6 +78,10 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1 -Startup
                   喋る → 0.5秒黙る → 貼り付け  … 止めるまで繰り返す
 ```
 
+- **喋っている途中から、パネルに文字が出ます**(軽いモデルでの速報。貼られるのは黙った後に
+  large-v3 で確定した文なので、速報の誤字はそのまま貼られません)
+- **長く喋り続けるときは、息継ぎ(0.25 秒)でも区切って先に貼っていきます。** 4 秒を超えた
+  発話が対象です。区切らないと、30 秒喋ればその 30 秒間なにも貼られません
 - **止め方**: マイクボタンをクリック / `Ctrl+Alt+Space` / 30 秒何も喋らない
 - 赤の間は `Enter` を遮断しません。貼り付いた文をそのまま `Enter` で送信できます
   (手押し録音のときだけは、誤送信防止のため録音中の `Enter` を遮断します)
@@ -124,6 +132,8 @@ powershell -ExecutionPolicy Bypass -File .\create_shortcut.ps1 -Startup
 | ウェイクワードを変える | `wake_word.py` の `_WAKE_RE`(表記揺れを吸収するため正規化後のパターン) |
 | 発話の拾い始め/切れ目が合わない | `wake_listener.py` の `VAD_SPEECH_PROB` / `VAD_SILENCE_PROB`(Silero VAD の確率しきい値) |
 | 喋り終わりから貼られるまでの間 | `app_rt.py` の `DICTATE_SILENCE_SEC`(既定 0.5 秒。短いほど速いが文中の「間」で細切れに貼られやすい) |
+| 長い発話を息継ぎで区切る | `app_rt.py` の `DICTATE_LONG_SPEECH_SEC`(既定 4 秒)/ `DICTATE_BREATH_SEC`(既定 0.25 秒。短すぎると語の途中で切れる) |
+| ウェイクワードの拾いやすさ | `wake_word.py` の `WAKE_PROMPT`(待受の文字起こしに渡すヒント)/ `wake_listener.py` の `WAKE_JOIN_SEC`(ゆっくり言って割れた「やっほー」「クロード」をつなぐ時間) |
 | 口述セッションが自動で終わるまでの時間 | `app_rt.py` の `SESSION_IDLE_TIMEOUT_SEC`(既定 30 秒) |
 
 ### 固有名詞が誤変換されるとき

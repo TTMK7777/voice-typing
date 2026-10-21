@@ -272,6 +272,85 @@ class WakeDetectorTest(unittest.TestCase):
         self.assertEqual(self.seen, [])
 
 
+class WakeJoinTest(unittest.TestCase):
+    """ゆっくり言うと「やっほー」と「クロード」が別々の区間に割れる。
+
+    実測(2026-10-21, TTS 話速 -3): 間が無音待ち(0.5 秒)を超え、'やっほー。' と
+    'クロード。' の 2 区間に分かれて検出漏れになった。直前の区間とつないでも判定する。
+    """
+
+    setUp = WakeDetectorTest.setUp
+    _feed = WakeDetectorTest._feed
+    _wait = WakeDetectorTest._wait
+
+    def _make(self, join_sec=wake_listener.WAKE_JOIN_SEC):
+        replies = iter(self.replies)
+
+        def transcribe(audio):
+            self.seen.append(len(audio) / wake_listener.SAMPLE_RATE)
+            return next(replies, "")
+
+        return wake_listener.WakeDetector(
+            transcribe=transcribe,
+            on_wake=lambda: self.fired.append(True),
+            is_speech=_loud_is_speech,
+            join_sec=join_sec,
+        )
+
+    def _two_words(self, det):
+        self._feed(det, np.concatenate([
+            _tone(0.6, 0.2), _silence(0.8), _tone(0.6, 0.2), _silence(1.0)]))
+        self._wait(det)
+
+    def test_split_wake_word_is_joined(self):
+        self.replies = ["やっほー。", "クロード。"]
+        det = self._make()
+        det.start()
+        self._two_words(det)
+        det.stop()
+        self.assertEqual(len(self.seen), 2, "前提: 2 区間に割れていない")
+        self.assertEqual(len(self.fired), 1, "割れたウェイクワードを拾えていない")
+
+    def test_segments_far_apart_are_not_joined(self):
+        # 時間が離れた発話までつなぐと、「やっほー」→(しばらく後)「クロード、…」で誤発火する
+        self.replies = ["やっほー。", "クロード。"]
+        det = self._make(join_sec=0.0)
+        det.start()
+        self._two_words(det)
+        det.stop()
+        self.assertEqual(self.fired, [])
+
+    def test_only_a_bare_first_half_is_joined(self):
+        # 「やっほー、元気?」→「クラウドの件」をつなぐと「やほげんき…くらうど」で当たってしまう。
+        # つなぐのは 1 つ目が「やっほー」だけで終わっているときに限る(レビュー指摘 N1)
+        self.replies = ["やっほー、元気?", "クラウドの件"]
+        det = self._make()
+        det.start()
+        self._two_words(det)
+        det.stop()
+        self.assertEqual(self.fired, [])
+
+    def test_restart_forgets_the_previous_segment(self):
+        # 待受を開き直したら前の区間は持ち越さない(セッション明けの「クロード」で再発火しない)
+        self.replies = ["やっほー。", "クロード。"]
+        det = self._make()
+        det.start()
+        self._feed(det, np.concatenate([_tone(0.6, 0.2), _silence(1.0)]))
+        self._wait(det)
+        det.start()
+        self._feed(det, np.concatenate([_tone(0.6, 0.2), _silence(1.0)]))
+        self._wait(det)
+        det.stop()
+        self.assertEqual(self.fired, [])
+
+
+class WakePromptTest(unittest.TestCase):
+    def test_prompt_is_itself_a_wake_word(self):
+        # 認識ヒントに渡す文がウェイクワードとして通らないなら、ヒントの意味がない
+        from wake_word import WAKE_PROMPT
+        self.assertTrue(is_wake(WAKE_PROMPT))
+
+
 class _Cp932Stdout:
     """cp932 のコンソールを模したダミー stdout(表現できない文字で例外を投げる)。"""
 
@@ -516,6 +595,91 @@ class DictationSegmenterTest(unittest.TestCase):
         self._wait(timeout=1.0)
         seg.stop()
         self.assertEqual(self.segments, [], "黙っていないのに途中で貼られている")
+
+    def test_long_speech_is_split_at_a_breath(self):
+        # 長く喋り続けたら、短い息継ぎでも区切って先に確定させる(喋っている間に貼られる)。
+        # 区切らないと、30 秒喋れば 30 秒間なにも出ない
+        seg = self._make(long_speech_sec=2.0, short_silence_sec=0.25)
+        seg.start()
+        self._feed(seg, np.concatenate([
+            _tone(2.5, 0.2), _silence(0.45), _tone(1.0, 0.2), _silence(1.0)]))
+        self._wait()
+        seg.stop()
+        self.assertEqual(len(self.segments), 2, "長い発話が息継ぎで区切られていない")
+
+    def test_short_speech_keeps_the_normal_pause(self):
+        # まだ短いうちの息継ぎでは切らない(文の途中で細切れにしない)
+        seg = self._make(long_speech_sec=2.0, short_silence_sec=0.25)
+        seg.start()
+        self._feed(seg, np.concatenate([
+            _tone(1.0, 0.2), _silence(0.45), _tone(1.0, 0.2), _silence(1.2)]))
+        self._wait()
+        seg.stop()
+        self.assertEqual(len(self.segments), 1, "短い発話の息継ぎで切れている")
+
+    def test_short_tail_after_a_breath_split_is_kept(self):
+        # 息継ぎで区切った直後の短い語尾(「…です。」の「です」)は最小長に届かない。
+        # 区切る前なら同じ発話に入っていたので、ここで捨てると語尾が消える(レビュー指摘 M2)
+        seg = self._make(long_speech_sec=2.0, short_silence_sec=0.25)
+        seg.start()
+        self._feed(seg, np.concatenate([
+            _tone(2.5, 0.2), _silence(0.45), _tone(0.3, 0.2), _silence(1.0)]))
+        self._wait()
+        seg.stop()
+        self.assertEqual(len(self.segments), 2, "息継ぎ後の短い語尾が消えている")
+
+    def test_short_blip_long_after_a_breath_split_is_still_ignored(self):
+        # しっかり黙った後の短い物音は、従来どおり捨てる(緩めるのは「続き」だけ)
+        seg = self._make(long_speech_sec=2.0, short_silence_sec=0.25)
+        seg.start()
+        self._feed(seg, np.concatenate([
+            _tone(2.5, 0.2), _silence(0.45), _silence(1.0), _tone(0.3, 0.2), _silence(1.0)]))
+        self._wait()
+        seg.stop()
+        self.assertEqual(len(self.segments), 1, "黙った後の物音まで貼られている")
+
+    def test_restart_does_not_leave_two_workers(self):
+        # 確定待ちで止まっている間に終了→再開すると、古い worker が生き残って
+        # 新しい worker とキューを取り合い、貼る順番が入れ替わっていた(レビュー指摘 M1)
+        import threading
+        release = threading.Event()
+        idents = []
+
+        def on_segment(audio):
+            idents.append(threading.get_ident())
+            if len(idents) == 1:
+                release.wait(timeout=5)
+
+        seg = wake_listener.SpeechSegmenter(
+            on_segment, silence_hold_sec=0.7, min_speech_sec=0.5, max_segment_sec=60.0,
+            queue_size=8, is_speech=_loud_is_speech)
+        seg.start()
+        self._feed(seg, np.concatenate([_tone(1.0, 0.2), _silence(1.0)]))
+        time.sleep(0.2)                  # 1 件目で止まっている
+        seg.stop()
+        seg.start()                      # 古い worker は join のタイムアウトで残る
+        release.set()                    # 古い worker が目を覚ます
+        for _ in range(3):
+            self._feed(seg, np.concatenate([_tone(1.0, 0.2), _silence(1.0)]))
+        time.sleep(0.5)
+        seg.stop()
+        later = idents[1:]
+        self.assertEqual(len(later), 3)
+        self.assertEqual(len(set(later)), 1, "再開後の発話を 2 本の worker が取り合っている")
+        self.assertNotIn(idents[0], later, "古い worker が再開後も処理を続けている")
+
+    def test_current_audio_is_the_utterance_in_progress(self):
+        # 喋っている途中のプレビュー用。まだ区切られていない区間を返す
+        seg = self._make()
+        seg.start()
+        self.assertIsNone(seg.current_audio())
+        self._feed(seg, _tone(1.0, 0.2))
+        audio = seg.current_audio()
+        self.assertIsNotNone(audio)
+        self.assertGreaterEqual(len(audio) / wake_listener.SAMPLE_RATE, 0.9)
+        self._feed(seg, _silence(1.0))     # 区切られたら進行中の区間は無い
+        self.assertIsNone(seg.current_audio())
+        seg.stop()
 
     def test_backlog_is_reported_not_silently_dropped(self):
         # 文字起こしが詰まって捨てるときは必ずログに出す(黙って消えるのが最悪)

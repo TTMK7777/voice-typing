@@ -22,7 +22,7 @@ import time
 
 import numpy as np
 
-from wake_word import is_wake
+from wake_word import is_wake, is_wake_head
 
 SAMPLE_RATE = 16000
 
@@ -70,6 +70,8 @@ WAKE_MAX_SEGMENT_SEC = 3.0      # 判定に使う音声の最大長(ウェイク
 WAKE_CHECK_INTERVAL_SEC = 1.0   # 発話が続いていてもこの間隔で判定する
                                 # (無音待ちだけだと、間を空けずに喋り続けた時に
                                 #  いつまでも判定が走らないため)
+WAKE_JOIN_SEC = 2.0             # 直前の区間からこの時間内なら、つないでも判定する
+                                # (ゆっくり言うと「やっほー」「クロード」が別区間に割れる)
 
 
 def rms(block):
@@ -132,6 +134,7 @@ class SpeechSegmenter:
                  min_speech_sec=WAKE_MIN_SPEECH_SEC,
                  max_segment_sec=WAKE_MAX_SEGMENT_SEC,
                  check_interval_sec=None,
+                 long_speech_sec=None, short_silence_sec=None,
                  queue_size=2, log=None, is_speech=None):
         self._on_segment = on_segment
         self._sr = sample_rate
@@ -142,6 +145,10 @@ class SpeechSegmenter:
         self._pending = np.zeros(0, dtype=np.float32)
         self.last_speech_at = 0.0
         self._silence_hold_sec = silence_hold_sec
+        # 発話が long_speech_sec を超えたら、short_silence_sec の息継ぎでも区切る。
+        # 長く喋っている間にも前半を確定・貼り付けへ回すため(None なら区切らない)
+        self._long_samples = int(long_speech_sec * sample_rate) if long_speech_sec else None
+        self._short_silence_sec = short_silence_sec
         self._min_samples = int(min_speech_sec * sample_rate)
         self._max_samples = int(max_segment_sec * sample_rate)
         self._check_interval_sec = check_interval_sec
@@ -149,6 +156,12 @@ class SpeechSegmenter:
         self._queue = queue.Queue(maxsize=queue_size)
         self._enabled = False
         self._thread = None
+        # start()/stop() のたびに進む番号。worker は自分の世代が古くなったら抜ける
+        # (確定待ちで止まっている間に終了→再開すると、古い worker が生き残って
+        #  新しい worker とキューを取り合い、貼る順番が入れ替わるため)
+        self.generation = 0
+        self._continuation = False   # 直前を息継ぎで区切った(次の区間はその続き)
+        self._gap_sec = 0.0          # 息継ぎで区切ってからの無音の長さ
         self._reset()
 
     # ---- 状態 ----
@@ -170,6 +183,19 @@ class SpeechSegmenter:
         if self._detector is not None:
             self._detector.load()
 
+    def current_audio(self):
+        """まだ区切られていない(喋っている途中の)区間の音声。無ければ None。
+
+        オーディオコールバックが書き足している最中に別スレッドから読むので、
+        リストの参照を一度取ってから複製して使う(_reset は新しいリストに差し替える)。
+        """
+        if not self._in_speech:
+            return None
+        blocks = list(self._segment)
+        if not blocks:
+            return None
+        return np.concatenate(blocks, axis=0).flatten()
+
     def start(self):
         # 直前の worker が終了しかけている場合がある(検出直後など)ので待つ。
         # ここで「生きているから」と早期 return すると _enabled が False のままになり、
@@ -179,18 +205,21 @@ class SpeechSegmenter:
             self._wake_worker()
             self._thread.join(timeout=1.0)
         self._reset()
+        self._continuation = False
         self._pending = np.zeros(0, dtype=np.float32)
         if self._detector is not None:
             self._detector.reset()
         # 一度も喋らないまま無音判定されないよう、開始時刻を入れておく
         self.last_speech_at = time.monotonic()
         self._drain()
+        self.generation += 1
         self._enabled = True
-        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread = threading.Thread(target=self._worker, args=(self.generation,), daemon=True)
         self._thread.start()
 
     def stop(self):
         self._enabled = False
+        self.generation += 1
         self._reset()
         self._wake_worker()
 
@@ -241,13 +270,29 @@ class SpeechSegmenter:
                     self._submit()
         elif self._in_speech:
             self._silence_sec += duration
-            if self._silence_sec <= self._silence_hold_sec:
+            hold = self._hold_sec()
+            if self._silence_sec <= hold:
                 self._append(block)  # 語尾が切れないよう無音の頭までは含める
-            if self._silence_sec >= self._silence_hold_sec:
+            if self._silence_sec >= hold:
+                breath = hold < self._silence_hold_sec
+                gap = self._silence_sec
                 self._submit()
                 self._reset()
+                # 息継ぎで区切ったなら、次の区間は同じ発話の続き(短くても捨てない)
+                self._continuation, self._gap_sec = breath, gap
         else:
             self._preroll.append(block)   # 次の発話の語頭用に直前を持っておく
+            if self._continuation:
+                # 普通の「黙った」長さに達したら、もう続きではない
+                self._gap_sec += duration
+                if self._gap_sec >= self._silence_hold_sec:
+                    self._continuation = False
+
+    def _hold_sec(self):
+        """今の区間を区切るのに必要な無音の長さ。長く喋っている間は息継ぎで足りる。"""
+        if self._long_samples is not None and self._voiced_samples >= self._long_samples:
+            return self._short_silence_sec
+        return self._silence_hold_sec
 
     def _append(self, block):
         if self._segment_samples < self._max_samples:
@@ -258,7 +303,10 @@ class SpeechSegmenter:
         """今の発話区間をキューへ(重い処理は worker が行う)。"""
         # 長さの判定は「音があったフレーム」だけで行う。無音待ち(silence_hold_sec)分を
         # 足した長さで判定すると、咳払いのような一瞬の物音が閾値をすり抜ける。
-        if self._voiced_samples < self._min_samples:
+        # ただし息継ぎで区切った直後の続き(「…です。」の「です」)は短くても通す。
+        # 区切る前なら同じ発話に入っていた音なので、ここで捨てると語尾が消える。
+        min_samples = 1 if self._continuation else self._min_samples
+        if self._voiced_samples < min_samples:
             return
         audio = np.concatenate(self._segment, axis=0).flatten()
         try:
@@ -268,10 +316,10 @@ class SpeechSegmenter:
             self._log(f"[segmenter] 処理が追いつかず {len(audio) / self._sr:.1f}s を捨てました")
 
     # ---- 処理スレッド ----
-    def _worker(self):
-        while self._enabled:
+    def _worker(self, generation):
+        while self._enabled and generation == self.generation:
             audio = self._queue.get()
-            if audio is None or not self._enabled:
+            if audio is None or not self._enabled or generation != self.generation:
                 continue
             try:
                 self._on_segment(audio)
@@ -287,10 +335,13 @@ class WakeDetector:
     """
 
     def __init__(self, transcribe, on_wake, sample_rate=SAMPLE_RATE, log=None,
-                 is_speech=None):
+                 is_speech=None, join_sec=WAKE_JOIN_SEC):
         self._transcribe = transcribe
         self._on_wake = on_wake
         self._log = log or (lambda msg: None)
+        self._join_sec = join_sec
+        self._prev_text = ""
+        self._prev_at = 0.0
         self._segmenter = SpeechSegmenter(
             self._check,
             sample_rate=sample_rate,
@@ -310,6 +361,7 @@ class WakeDetector:
         return self._segmenter.enabled
 
     def start(self):
+        self._prev_text = ""   # 開き直す前の区間は持ち越さない
         self._segmenter.start()
 
     def stop(self):
@@ -322,8 +374,16 @@ class WakeDetector:
         text = self._transcribe(audio)
         if not text:
             return
-        hit = is_wake(text)
+        now = time.monotonic()
+        # つなぐのは直前が「やっほー」だけで終わっていたときに限る。何でもつなぐと
+        # 「やっほー、元気?」→「クラウドの件」が「やほげんき…くらうど」で当たってしまう
+        joined = ""
+        if now - self._prev_at <= self._join_sec and is_wake_head(self._prev_text):
+            joined = self._prev_text + text
+        self._prev_text, self._prev_at = text, now
+        hit = is_wake(text) or (bool(joined) and is_wake(joined))
         self._log(f"[wake] {text!r} -> {'HIT' if hit else 'ignore'}")
         if hit:
+            self._prev_text = ""
             self._segmenter.stop()  # 二重発火を防ぐ(再開はアプリ側が行う)
             self._on_wake()
