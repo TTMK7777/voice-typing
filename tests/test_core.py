@@ -238,7 +238,7 @@ class VocabPromptBudgetTest(unittest.TestCase):
 
     def test_short_vocab_is_kept_whole(self):
         import tempfile
-        words = ["山王病院", "つじラボ", "オリコン"]
+        words = ["見本中央病院", "つじラボ", "見本商事"]
         with tempfile.TemporaryDirectory() as tmp:
             vc = self._core(words, tmp)
         for w in words:
@@ -284,7 +284,7 @@ class VocabPromptBudgetTest(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch("builtins.print") as p:
-                self._core(["山王病院", "つじラボ"], tmp)
+                self._core(["見本中央病院", "つじラボ"], tmp)
         p.assert_not_called()
 
 
