@@ -1,6 +1,6 @@
 # 保守ガイド
 
-このリポ（日本語の音声入力ツール）を、AI を使わずに保守するための案内です。使い方・インストールは [README.md](README.md)、セキュリティの説明は [SECURITY.md](SECURITY.md)、PR の出し方は [CONTRIBUTING.md](CONTRIBUTING.md) が正本です。ここはそれらに載っていない「どこを触れば何が変わるか」をまとめます。
+このリポ（日本語の音声入力ツール）を、AI を使わずに保守するための案内です。使い方・インストールは [README.md](README.md)、セキュリティの説明は [SECURITY.md](SECURITY.md)、PR の出し方は [CONTRIBUTING.md](CONTRIBUTING.md)、現在地・判断待ちは [STATUS.md](STATUS.md)（AI 向けの [AGENTS.md](AGENTS.md) もここから読むよう指示している）が正本です。ここはそれらに載っていない「どこを触れば何が変わるか」をまとめます。
 
 ## ファイルの種類
 
@@ -12,7 +12,7 @@
 | 文書 | `README.md`・`SECURITY.md`・`STATUS.md` | 人が読む説明 | `README.md` の調整表の既定値は手で写してある（下記） |
 | AI への指示書 | `AGENTS.md` | AI（Codex 等）がこのリポを扱うときに最初に読む短い指示。レビューコメントを日本語で書く等 | 動作には影響しない。人間が読んでもよい |
 
-テストでもアプリ本体でもない `test_transcribe.py`・`gen_test_wav.ps1`・`test_text.txt` は、作者が認識精度を手で確かめるための補助です（`tests/` の自動テストには含まれない）。実行には NVIDIA GPU とモデルのダウンロードが要るため、この保守ガイドの確認手順には入れていません。
+テストでもアプリ本体でもない `test_transcribe.py`・`gen_test_wav.ps1`・`test_text.txt` は、作者が認識精度を手で確かめるための補助です（`tests/` の自動テストには含まれない）。`test_transcribe.py` は NVIDIA GPU とモデルのダウンロードが要るため、この保守ガイドの確認手順には入れていません。`gen_test_wav.ps1` は Windows の音声合成で `test.wav` を作る PowerShell で、GPU は不要です。`tests/test_wake_word.py` の実声のテストは `test.wav` が無いとスキップされる（全テストの「skipped」がそれ）ので、このスクリプトで作ると実行されます。
 
 ## よくある作業（逆引き）
 
@@ -21,10 +21,10 @@
 | やりたいこと | 触るファイル | 手で合わせる場所 | 確かめ方 |
 |---|---|---|---|
 | 音声コマンドを足す・変える（「クロード、クリア」等） | `core.py` の `VOICE_COMMANDS` と `COMMAND_TRIGGERS`。固定しているテスト: `tests/test_core.py` | `README.md` の「音声コマンド」の表 | 全テスト。コマンド語の名前を変えると `tests/test_core.py` が赤になる |
-| 新しい幻覚フレーズ（無音で混入する定型句）を消す | `core.py` の `HALLUCINATIONS` に 1 行足す。固定しているテスト: `tests/test_core.py` | なし | 全テスト。既存の行を消すと `tests/test_core.py` が赤になる |
-| ウェイクワードを変える | `wake_word.py` の `_WAKE_RE`（正規化後の文字に対する正規表現）と `WAKE_PROMPT`。固定しているテスト: `tests/test_wake_word.py`、`tests/test_app_wiring.py`（`WAKE_PROMPT` を参照） | `README.md` の「ハンズフリー」の説明文（「やっほークロード」）、`app_rt.py` のボタンのツールチップ（マウスを乗せると出る説明） | 全テスト。`_WAKE_RE` を狭めると `tests/test_wake_word.py` が赤になる。実際に待受が拾うかは実機（マイク）での確認が必要 |
-| 発話の拾い始め・切れ目を変える | `wake_listener.py` の `VAD_SPEECH_PROB` / `VAD_SILENCE_PROB`（Silero VAD＝発話区間を見つける軽いモデルの確率しきい値）、`WAKE_JOIN_SEC` | `README.md` の調整表 | 全テストは通るだけ（値そのものは固定していない）。実機で喋って確認が必要 |
-| 喋り終わりから貼られるまでの間・息継ぎ区切り・自動終了の時間を変える | `app_rt.py` の `DICTATE_SILENCE_SEC`・`DICTATE_LONG_SPEECH_SEC`・`DICTATE_BREATH_SEC`・`SESSION_IDLE_TIMEOUT_SEC` | `README.md` の調整表と「ハンズフリー」の説明（0.5 秒・30 秒・4 秒・0.25 秒）、`SECURITY.md` の「既知の限界」（30 秒） | 値を変えても全テストは赤にならない（テストは定数を名前で参照しているだけ）。実機で確認が必要 |
+| 新しい幻覚フレーズ（無音で混入する定型句）を消す | `core.py` の `HALLUCINATIONS` に 1 行足す。固定しているテスト: `tests/test_core.py` | なし | 全テスト。テストが見ているのは「ご視聴ありがとうございました」の 1 行だけ（`tests/test_core.py` の `test_strips_known_hallucination`）。ほかの行を消しても赤にならない（「ご清聴ありがとうございます」で確認）ので、足した・消した語は手で試す |
+| ウェイクワードを変える | `wake_word.py` の `_WAKE_RE`（正規化後の文字に対する正規表現）・`_WAKE_HEAD_RE`（「やっほー」だけで終わる前半の判定。`wake_listener.py` が `is_wake_head` 経由で割れた発話をつなぐのに使う）・`WAKE_PROMPT`。固定しているテスト: `tests/test_wake_word.py`、`tests/test_app_wiring.py`（`WAKE_PROMPT` を参照）。語そのものを変えるときは `tests/test_wake_word.py` の例文も書き換える | `README.md` の「ハンズフリー」の説明文（「やっほークロード」）、`app_rt.py` のボタンのツールチップ（マウスを乗せると出る説明） | 全テスト。`_WAKE_RE` の `や[はほ]` を `や[は]` に狭めると `tests/test_wake_word.py` が赤になる。実際に待受が拾うかは実機（マイク）での確認が必要 |
+| 発話の拾い始め・切れ目を変える | `wake_listener.py` の `VAD_SPEECH_PROB` / `VAD_SILENCE_PROB`（Silero VAD＝発話区間を見つける軽いモデルの確率しきい値）、`WAKE_JOIN_SEC` | `README.md` の調整表 | 全テスト。実測: `VAD_SPEECH_PROB` を 0.5 から 0.01 に下げると `tests/test_wake_word.py` の無音・雑音のテスト（`SileroSpeechDetectorTest`）が赤になる。0.99 に上げても、`WAKE_JOIN_SEC` を 2.0 から 0.1 に下げても緑のまま（実声のテストは `test.wav` が無いとスキップ）。つまり検出できるのは「無音を発話と誤判定する」方向だけ。取りこぼしの方向は実機で喋って確認が必要 |
+| 喋り終わりから貼られるまでの間・息継ぎ区切り・自動終了の時間を変える | `app_rt.py` の `DICTATE_SILENCE_SEC`・`DICTATE_LONG_SPEECH_SEC`・`DICTATE_BREATH_SEC`・`SESSION_IDLE_TIMEOUT_SEC` | `README.md` の調整表と「ハンズフリー」の説明（0.5 秒・30 秒・4 秒・0.25 秒）、`SECURITY.md` の「既知の限界」（30 秒。連続口述セッションの項の 2 か所: 本文と「止め方」の行） | 全テスト。`DICTATE_SILENCE_SEC` を 0.5 から 0.9 にしても緑のまま（実測）。`tests/test_app_wiring.py` は `SESSION_IDLE_TIMEOUT_SEC`・`DICTATE_LONG_SPEECH_SEC`・`DICTATE_BREATH_SEC` を名前で参照するだけで、値は固定していない。値の良し悪しは実機で確認が必要 |
 | プレビューの速さ・表示文字数・モデルを変える | `app_rt.py` の `PREVIEW_INTERVAL`・`MAX_PREVIEW_CHARS`・`PREVIEW_MODEL` | `README.md` の調整表 | 全テストは赤にならない。実機で確認が必要 |
 | ホットキーを変える | `app_rt.py` の `HOTKEY`・`WAKE_HOTKEY`、ボタンだけの簡易版 `app.py` の `HOTKEY` | `README.md`（使い方・ハンズフリー）、`SECURITY.md`（権限の表と既知の限界）、`app_rt.py` と `app.py` のツールチップ・ログ文言（`Ctrl+Alt+Space` と書いてある所） | 全テストは赤にならない。実機で確認が必要 |
 | 認識ヒント（よく使う語）を足す | 利用者が `vocab.example.txt` を `vocab.txt` にコピーして編集（`vocab.txt` は個人用で git に載らない） | なし | 1 語 5 トークン前後で 30 語ほどが上限。超えると起動時に `[vocab]` 警告が黒窓に出る |
@@ -44,9 +44,9 @@
    .\.venv\Scripts\python.exe -m unittest discover -s tests -v
    ```
 
-   依存が入っていないと、`faster_whisper` の import で一部のテストが落ちる（`ModuleNotFoundError`）。コードの不具合ではなく手順 1 の不足。
+   依存が入っていないと、`numpy`・`sounddevice`・`PySide6` などの import で `tests/test_core.py` と `tests/test_app_wiring.py` が読み込みの段階で落ち、`faster_whisper` が無いと VAD のテスト（`SileroSpeechDetectorTest`）も落ちる（`ModuleNotFoundError`）。コードの不具合ではなく手順 1 の不足。
 
-3. GUI・貼り付け・ホットキーを変えたときは、実機で起動して試す（[CONTRIBUTING.md](CONTRIBUTING.md) の「PR の出し方」4 番）。起動すると画面にマイクボタンが出る。**このガイドの作成時は実機起動をしていない**ため、起動の確認手順は [README.md](README.md) の「起動」に従うこと
+3. GUI・貼り付け・ホットキーを変えたときは、実機で起動して試す（[CONTRIBUTING.md](CONTRIBUTING.md) の「PR の出し方」4 番）。起動の手順と確認は [README.md](README.md) の「起動」に従うこと
 
 CI（自動テスト）は置いていません。理由は [README.md](README.md) の「検討して見送ったこと」にあります。
 
